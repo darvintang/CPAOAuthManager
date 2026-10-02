@@ -60,7 +60,7 @@ func resetTestState() {
 
 func TestPluginRegistrationIncludesRequiredRepositoryMetadata(t *testing.T) {
 	reg := pluginRegistration()
-	if reg.Metadata.GitHubRepository != "https://github.com/darvintang/CPA-OAuth-Concurrency" {
+	if reg.Metadata.GitHubRepository != "https://github.com/darvintang/CPA-OAuth-Manager" {
 		t.Fatalf("GitHubRepository = %q", reg.Metadata.GitHubRepository)
 	}
 	if reg.Metadata.Name != "凭证并发管理" || reg.Metadata.Version != "0.0.1" || reg.Metadata.Author != "tsunheimat" || !reg.Capabilities.Scheduler || !reg.Capabilities.RequestInterceptorEnforcesAdmission {
@@ -973,6 +973,10 @@ func TestLocalAuthorityHardCapAndExactlyOnceRelease(t *testing.T) {
 	second, err := a.Acquire(context.Background(), "a", 2, 1, classWarm)
 	if err != nil {
 		t.Fatal(err)
+	}
+	// Back-to-back acquisitions must remain distinct even within one clock tick.
+	if first.Token == second.Token {
+		t.Fatal("consecutive leases share a token")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
 	defer cancel()

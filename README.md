@@ -143,7 +143,7 @@ request or store auth JSON, provider tokens, passwords, or the Management key.
 
 Download the assets from the public GitHub Release:
 
-<https://github.com/darvintang/CPA-OAuth-Concurrency/releases/tag/v0.0.1>
+<https://github.com/darvintang/CPA-OAuth-Manager/releases/tag/v0.0.1>
 
 The release contains all CPA Plugin Store required targets:
 

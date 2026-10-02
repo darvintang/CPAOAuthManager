@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -165,7 +166,8 @@ func (a *localAuthority) Acquire(ctx context.Context, key string, limit, reserve
 			allowed = u.InFlight < general
 		}
 		if allowed {
-			token := fmt.Sprintf("%x", sha256.Sum256([]byte(key+":"+strconv.FormatInt(time.Now().UnixNano(), 10))))
+			// Wall-clock timestamps can repeat on Windows and overwrite an active lease.
+			token := rand.Text()
 			lease := Lease{Token: token, Key: key, Class: class}
 			a.active[token] = lease
 			u.Limit, u.Reserved, u.InFlight = limit, reserved, u.InFlight+1
@@ -392,7 +394,8 @@ func (a *redisAuthority) Acquire(ctx context.Context, account string, limit, res
 	}
 	ctx, cancel := ensureAuthorityContext(ctx)
 	defer cancel()
-	token := fmt.Sprintf("%x", sha256.Sum256([]byte(account+":"+strconv.FormatInt(time.Now().UnixNano(), 10))))
+	// Random IDs also avoid collisions between hosts sharing the Redis authority.
+	token := rand.Text()
 	result, err := a.client.Eval(ctx, redisAcquireScript, []string{a.key(account)}, limit, reserved, int(class), token, time.Now().UnixMilli(), leaseTTL.Milliseconds())
 	if err != nil {
 		return Lease{}, fmt.Errorf("%w: %v", ErrAuthorityUnavailable, err)
