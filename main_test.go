@@ -1,0 +1,1936 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+)
+
+// Keep test payloads independent of the optional AuthID convenience field in
+// newer host SDK checkouts. The plugin's post-auth wire decoder accepts this
+// legacy field, while stock CPA uses Metadata.selected_auth_id.
+type testRequestInterceptRequest struct {
+	RequestID string
+	AuthID    string `json:"AuthID,omitempty"`
+	Model     string
+	Metadata  map[string]any
+}
+
+func resetTestState() {
+	hostAuthCallState.mu.Lock()
+	hostAuthCallState.retiring = false
+	hostAuthCallState.inFlight = false
+	hostAuthCallState.activeWorkers = 0
+	hostAuthCallState.done = nil
+	hostAuthCallState.mu.Unlock()
+	state.gate.Lock()
+	defer state.gate.Unlock()
+	state.mu.Lock()
+	oldRequests := make([]*requestLifecycle, 0, len(state.requests))
+	for _, rs := range state.requests {
+		oldRequests = append(oldRequests, rs)
+	}
+	state.mu.Unlock()
+	for _, rs := range oldRequests {
+		rs.mu.Lock()
+		rs.terminal = true
+		stopHeartbeat(rs)
+		rs.mu.Unlock()
+	}
+	state.mu.Lock()
+	state.cfg = pluginConfig{Enabled: true, MaxConcurrency: 2, WarmReservedSlots: 1, WaitTimeout: 2 * time.Millisecond, Authority: "local"}
+	state.authority = newLocalAuthority()
+	state.leases = make(map[string]Lease)
+	state.bound = make(map[string]string)
+	state.requests = make(map[string]*requestLifecycle)
+	state.stopping = false
+	state.uncertain = false
+	state.reloadFence = false
+	state.mu.Unlock()
+}
+
+func TestPluginRegistrationIncludesRequiredRepositoryMetadata(t *testing.T) {
+	reg := pluginRegistration()
+	if reg.Metadata.GitHubRepository != "https://github.com/darvintang/CPA-OAuth-Concurrency" {
+		t.Fatalf("GitHubRepository = %q", reg.Metadata.GitHubRepository)
+	}
+	if reg.Metadata.Name != "凭证并发管理" || reg.Metadata.Version != "0.0.1" || reg.Metadata.Author != "tsunheimat" || !reg.Capabilities.Scheduler || !reg.Capabilities.RequestInterceptorEnforcesAdmission {
+		t.Fatalf("registration = %#v", reg)
+	}
+	if !reg.Capabilities.ManagementAPI {
+		t.Fatal("registration omitted management_api capability")
+	}
+}
+
+func TestManagementRegistrationAndLiveSnapshotAreReadOnlyAndRedacted(t *testing.T) {
+	resetTestState()
+	oldInvoker, oldTimeout := hostAuthInvoker, hostAuthTimeout
+	t.Cleanup(func() { hostAuthInvoker, hostAuthTimeout = oldInvoker, oldTimeout; resetTestState() })
+	entry := pluginapi.HostAuthFileEntry{ID: "account-secret@example.com", Name: "account.json"}
+	rawList, _ := json.Marshal(envelope{OK: true, Result: mustJSON(hostAuthListResponse{Files: []pluginapi.HostAuthFileEntry{entry}})})
+	hostAuthInvoker = func() hostAuthListCallResult { return hostAuthListCallResult{raw: rawList} }
+	reg, err := handleMethod(pluginabi.MethodManagementRegister, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(reg), managementUsagePath) || !strings.Contains(string(reg), managementUIPath) {
+		t.Fatalf("registration = %s", reg)
+	}
+	raw, _ := json.Marshal(testRequestInterceptRequest{RequestID: "mgmt", AuthID: "account-secret@example.com"})
+	if _, err := interceptAfter(raw); err != nil {
+		t.Fatal(err)
+	}
+	before := len(state.leases)
+	request, _ := json.Marshal(managementRPCRequest{ManagementRequest: pluginapi.ManagementRequest{Method: http.MethodGet, Path: managementUsagePath}})
+	out, err := handleMethod(pluginabi.MethodManagementHandle, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(out), "account-secret") || strings.Contains(string(out), "@example.com") {
+		t.Fatalf("snapshot leaked account identity: %s", out)
+	}
+	var env envelope
+	if err := json.Unmarshal(out, &env); err != nil {
+		t.Fatal(err)
+	}
+	var managementResp pluginapi.ManagementResponse
+	if err := json.Unmarshal(env.Result, &managementResp); err != nil {
+		t.Fatal(err)
+	}
+	var snapshot concurrencySnapshot
+	if err := json.Unmarshal(managementResp.Body, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Stale {
+		t.Fatalf("snapshot = %#v", snapshot)
+	}
+	if len(snapshot.Accounts) != 1 {
+		t.Fatalf("snapshot accounts = %#v, want one active account", snapshot.Accounts)
+	}
+	if got := snapshot.Accounts[0]; got.Label != "account.json" || got.Limit != 2 || got.Reserved != 1 || got.InFlight != 1 || got.WarmFlight != 0 {
+		t.Fatalf("snapshot account = %#v", got)
+	}
+	serialized, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{`"label"`, `"limit"`, `"reserved"`, `"in_flight"`, `"warm_flight"`} {
+		if !strings.Contains(string(serialized), field) {
+			t.Fatalf("snapshot JSON missing nested field %s: %s", field, serialized)
+		}
+	}
+	if strings.Contains(string(serialized), `"key"`) {
+		t.Fatalf("snapshot JSON exposed authority key: %s", serialized)
+	}
+	for _, field := range []string{`"configured_limit"`, `"available_capacity"`} {
+		if strings.Contains(string(serialized), field) {
+			t.Fatalf("snapshot JSON exposed aggregate field %s: %s", field, serialized)
+		}
+	}
+	if got := len(state.leases); got != before {
+		t.Fatalf("snapshot mutated leases: before=%d after=%d", before, got)
+	}
+	if snapshot.Summary.Total.InFlight != 1 || snapshot.Summary.Total.Limit != 2 || snapshot.Summary.WarmReserved.InFlight != 0 || snapshot.Summary.WarmReserved.Reserved != 1 {
+		t.Fatalf("snapshot summary = %#v", snapshot.Summary)
+	}
+}
+
+func TestManagementUIContainsAuthenticatedRefreshAndFailureStates(t *testing.T) {
+	resp, err := (managementHandler{}).HandleManagement(context.Background(), pluginapi.ManagementRequest{Method: http.MethodGet, Path: "/v0/resource/plugins/" + pluginID + "/ui"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(resp.Body)
+	if strings.Contains(body, `"in_flight":`) || strings.Contains(body, `"accounts_in_use":`) {
+		t.Fatal("unauthenticated resource embeds live allocation values")
+	}
+	for _, want := range []string{"/v0/management/plugins/cpa-oauth-concurrency/usage", "Settings", "type=\"password\"", "localStorage", "storageKey", "X-Management-Key", "credentials:'same-origin'", "method:'GET'", "Loading live usage", "Management key required.", "Unable to load live usage", "Management authentication required.", "stale", "aria-live", "All available accounts", "summary-total", "summary-warm", "Total (in-flight / limit)", "Warm reserved (in-flight / reserved)", "a.in_flight+' / '+a.limit", "a.warm_flight+' / '+a.reserved", "Save key", "Clear saved key", "removeItem", "setItem"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("UI missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{"sessionStorage", "?management", "Bearer test-secret", "/v0/management/auth-files", "account-secret@example.com", "user@example.com", "available_capacity", "Configured limit", "In flight", "Warm in flight", "General in flight"} {
+		if strings.Contains(body, forbidden) {
+			t.Errorf("UI contains forbidden credential material %q", forbidden)
+		}
+	}
+}
+
+func TestManagementUIKeyLifecycleAndAuthFailureHandling(t *testing.T) {
+	body := string(managementHTMLAuthenticated)
+	cases := []struct {
+		name string
+		want []string
+	}{
+		{name: "first run requires key", want: []string{"const authKey=readKey();if(!authKey)", "Management key required. Save a key in Settings"}},
+		{name: "save and reload use", want: []string{"localStorage.getItem(storageKey)", "localStorage.setItem(storageKey,value)", "keyInput.value=readKey()", "headers:{'X-Management-Key':authKey}"}},
+		{name: "update", want: []string{"keyInput.value.trim()", "writeKey(value)", "Management key saved for this browser."}},
+		{name: "clear", want: []string{"localStorage.removeItem(storageKey)", "keyInput.value=''", "Saved Management key cleared."}},
+		{name: "401 and 403", want: []string{"r.status===401||r.status===403", "Management authentication required."}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, want := range tc.want {
+				if !strings.Contains(body, want) {
+					t.Errorf("UI missing %q", want)
+				}
+			}
+		})
+	}
+	for _, forbidden := range []string{"?key=", "?management", "Authorization: Bearer", "console.log", "console.error"} {
+		if strings.Contains(body, forbidden) {
+			t.Errorf("UI contains unsafe credential path %q", forbidden)
+		}
+	}
+}
+
+func TestAccountLabelPrecedence(t *testing.T) {
+	key := "account-hash"
+	if got := accountLabel(key, map[string]pluginapi.HostAuthFileEntry{key: {Email: "user@example.com", Name: "account.json"}}); got != "user@example.com" {
+		t.Fatalf("email label = %q", got)
+	}
+	if got := accountLabel(key, map[string]pluginapi.HostAuthFileEntry{key: {Name: "account.json"}}); got != "account.json" {
+		t.Fatalf("name label = %q", got)
+	}
+	if got := accountLabel(key, nil); got != "Account" {
+		t.Fatalf("safe fallback label = %q", got)
+	}
+}
+
+func TestHostAuthMetadataUsesIDFirstAndNameFallback(t *testing.T) {
+	oldInvoker, oldTimeout := hostAuthInvoker, hostAuthTimeout
+	t.Cleanup(func() {
+		hostAuthInvoker, hostAuthTimeout = oldInvoker, oldTimeout
+		hostAuthCallState.mu.Lock()
+		hostAuthCallState.inFlight = false
+		hostAuthCallState.mu.Unlock()
+	})
+	entryID := pluginapi.HostAuthFileEntry{ID: "runtime-id", Name: "runtime.json", Email: "id@example.com"}
+	entryName := pluginapi.HostAuthFileEntry{Name: "disk.json", Email: "disk@example.com"}
+	raw, _ := json.Marshal(envelope{OK: true, Result: mustJSON(hostAuthListResponse{Files: []pluginapi.HostAuthFileEntry{entryID, entryName}})})
+	hostAuthInvoker = func() hostAuthListCallResult { return hostAuthListCallResult{raw: raw} }
+	metadata, err := hostAuthMetadata()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := accountLabel(accountKey("cpa", "runtime-id"), metadata); got != "id@example.com" {
+		t.Fatalf("ID mapping = %q", got)
+	}
+	if got := accountLabel(accountKey("cpa", "disk.json"), metadata); got != "disk@example.com" {
+		t.Fatalf("Name fallback mapping = %q", got)
+	}
+	if got := accountLabel(accountKey("cpa", "runtime.json"), metadata); got != "Account" {
+		t.Fatalf("unknown key fallback = %q", got)
+	}
+}
+
+func TestAuthEntryUnavailableUsesOnlyExplicitStatusMetadata(t *testing.T) {
+	future := time.Now().Add(time.Minute)
+	cases := []struct {
+		name  string
+		entry pluginapi.HostAuthFileEntry
+		want  bool
+	}{
+		{name: "disabled flag", entry: pluginapi.HostAuthFileEntry{Disabled: true}, want: true},
+		{name: "unavailable flag", entry: pluginapi.HostAuthFileEntry{Unavailable: true}, want: true},
+		{name: "unauthorized status", entry: pluginapi.HostAuthFileEntry{Status: "unauthorized"}, want: true},
+		{name: "http 401 message", entry: pluginapi.HostAuthFileEntry{StatusMessage: "HTTP 401 Unauthorized; re-login required"}, want: true},
+		{name: "failed status", entry: pluginapi.HostAuthFileEntry{Status: "authentication_error"}, want: true},
+		{name: "authentication failure status", entry: pluginapi.HostAuthFileEntry{Status: "  Authentication Failure  "}, want: true},
+		{name: "authentication failure message", entry: pluginapi.HostAuthFileEntry{StatusMessage: "authentication failure"}, want: true},
+		{name: "retry window", entry: pluginapi.HostAuthFileEntry{NextRetryAfter: future}, want: true},
+		{name: "usable status", entry: pluginapi.HostAuthFileEntry{Name: "account-401.json", Status: "active", StatusMessage: "ready"}, want: false},
+		{name: "empty status", entry: pluginapi.HostAuthFileEntry{Name: "401.json"}, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := authEntryUnavailable(tc.entry); got != tc.want {
+				t.Fatalf("authEntryUnavailable(%+v) = %v, want %v", tc.entry, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestHostAuthMetadataFiltersUnavailableWithoutInspectingNames(t *testing.T) {
+	oldInvoker, oldTimeout := hostAuthInvoker, hostAuthTimeout
+	t.Cleanup(func() {
+		hostAuthInvoker, hostAuthTimeout = oldInvoker, oldTimeout
+		hostAuthCallState.mu.Lock()
+		hostAuthCallState.inFlight = false
+		hostAuthCallState.mu.Unlock()
+	})
+	entries := []pluginapi.HostAuthFileEntry{
+		{ID: "auth-401", Name: "usable-401.json", Status: "active"},
+		{ID: "auth-unauthorized", Name: "still-available.json", StatusMessage: "HTTP 401 Unauthorized"},
+		{ID: "auth-disabled", Name: "disabled-but-no-name-heuristic.json", Disabled: true},
+	}
+	raw := mustJSON(envelope{OK: true, Result: mustJSON(hostAuthListResponse{Files: entries})})
+	hostAuthInvoker = func() hostAuthListCallResult { return hostAuthListCallResult{raw: raw} }
+	metadata, err := hostAuthMetadata()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(metadata) != 1 {
+		t.Fatalf("filtered metadata = %#v, want one usable entry", metadata)
+	}
+	if _, ok := metadata[accountKey("cpa", "auth-401")]; !ok {
+		t.Fatalf("usable 401-named account was filtered: %#v", metadata)
+	}
+}
+
+func TestHostAuthMetadataFailuresAreBoundedAndRedacted(t *testing.T) {
+	oldInvoker, oldTimeout := hostAuthInvoker, hostAuthTimeout
+	t.Cleanup(func() {
+		hostAuthInvoker, hostAuthTimeout = oldInvoker, oldTimeout
+		hostAuthCallState.mu.Lock()
+		hostAuthCallState.inFlight = false
+		hostAuthCallState.mu.Unlock()
+	})
+	hostAuthTimeout = 5 * time.Millisecond
+	cases := []struct {
+		name   string
+		result hostAuthListCallResult
+	}{
+		{name: "callback error", result: hostAuthListCallResult{code: 7}},
+		{name: "malformed", result: hostAuthListCallResult{raw: []byte("not-json")}},
+		{name: "empty", result: hostAuthListCallResult{raw: mustJSON(envelope{OK: true, Result: mustJSON(hostAuthListResponse{})})}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			hostAuthInvoker = func() hostAuthListCallResult { return tc.result }
+			if metadata, err := hostAuthMetadata(); err == nil || metadata != nil {
+				t.Fatalf("metadata=%v err=%v", metadata, err)
+			}
+		})
+	}
+	blocked := make(chan struct{})
+	hostAuthInvoker = func() hostAuthListCallResult { <-blocked; return hostAuthListCallResult{} }
+	started := time.Now()
+	if _, err := hostAuthMetadata(); err == nil || time.Since(started) > 100*time.Millisecond {
+		t.Fatalf("timeout err=%v elapsed=%s", err, time.Since(started))
+	}
+	close(blocked)
+	deadline := time.Now().Add(100 * time.Millisecond)
+	for {
+		hostAuthCallState.mu.Lock()
+		pending := hostAuthCallState.inFlight
+		hostAuthCallState.mu.Unlock()
+		if !pending || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestHostAuthTimeoutIsJoinedBeforeLifecycleReturns(t *testing.T) {
+	oldInvoker, oldTimeout := hostAuthInvoker, hostAuthTimeout
+	t.Cleanup(func() {
+		hostAuthInvoker, hostAuthTimeout = oldInvoker, oldTimeout
+		resetTestState()
+	})
+	hostAuthTimeout = 5 * time.Millisecond
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var mu sync.Mutex
+	active, maxActive, calls := 0, 0, 0
+	lifetimeEnded := false
+	hostAuthInvoker = func() hostAuthListCallResult {
+		mu.Lock()
+		active++
+		calls++
+		if active > maxActive {
+			maxActive = active
+		}
+		mu.Unlock()
+		close(started)
+		<-release
+		mu.Lock()
+		if lifetimeEnded {
+			t.Errorf("host callback accessed state after plugin lifetime ended")
+		}
+		active--
+		mu.Unlock()
+		return hostAuthListCallResult{code: 7}
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := hostAuthMetadata()
+		result <- err
+	}()
+	<-started
+	select {
+	case err := <-result:
+		if err == nil || !strings.Contains(err.Error(), "timed out") {
+			t.Fatalf("timeout result = %v", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("host metadata did not honor timeout")
+	}
+	joined := make(chan struct{})
+	go func() {
+		cliproxyPluginShutdown()
+		mu.Lock()
+		lifetimeEnded = true
+		mu.Unlock()
+		close(joined)
+	}()
+	select {
+	case <-joined:
+		t.Fatal("shutdown returned while timed-out host callback was still running")
+	case <-time.After(20 * time.Millisecond):
+	}
+	mu.Lock()
+	if calls != 1 || maxActive != 1 || active != 1 {
+		t.Fatalf("worker state before release: calls=%d max=%d active=%d", calls, maxActive, active)
+	}
+	mu.Unlock()
+	if _, err := hostAuthMetadata(); err == nil || !strings.Contains(err.Error(), "still pending") {
+		t.Fatalf("second metadata lookup while worker pending: %v", err)
+	}
+	mu.Lock()
+	if calls != 1 || maxActive != 1 {
+		t.Fatalf("second lookup accumulated a worker: calls=%d max=%d", calls, maxActive)
+	}
+	mu.Unlock()
+	close(release)
+	select {
+	case <-joined:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("shutdown did not join timed-out host callback")
+	}
+	mu.Lock()
+	if active != 0 || maxActive != 1 {
+		t.Fatalf("worker state after shutdown: max=%d active=%d", maxActive, active)
+	}
+	mu.Unlock()
+	hostAuthCallState.mu.Lock()
+	if hostAuthCallState.activeWorkers != 0 || hostAuthCallState.done != nil {
+		hostAuthCallState.mu.Unlock()
+		t.Fatalf("tracked workers after shutdown: active=%d done=%v", hostAuthCallState.activeWorkers, hostAuthCallState.done != nil)
+	}
+	hostAuthCallState.mu.Unlock()
+	if _, err := hostAuthMetadata(); err == nil {
+		t.Fatal("host callback started after shutdown lifetime fence")
+	}
+	mu.Lock()
+	if calls != 1 {
+		t.Fatalf("post-shutdown callback count = %d, want 1", calls)
+	}
+	mu.Unlock()
+
+	// Reconfigure is also a lifetime boundary: it must join a prior worker
+	// before returning and then permit one fresh callback after the fence lifts.
+	resetTestState()
+	started = make(chan struct{})
+	release = make(chan struct{})
+	hostAuthTimeout = 5 * time.Millisecond
+	hostAuthInvoker = func() hostAuthListCallResult {
+		close(started)
+		<-release
+		return hostAuthListCallResult{code: 7}
+	}
+	metadataDone := make(chan struct{})
+	go func() {
+		_, _ = hostAuthMetadata()
+		close(metadataDone)
+	}()
+	<-started
+	time.Sleep(10 * time.Millisecond)
+	config, _ := json.Marshal(lifecycleRequest{SchemaVersion: 4, ConfigYAML: []byte("authority: local\n")})
+	configured := make(chan error, 1)
+	go func() { configured <- configure(config) }()
+	select {
+	case err := <-configured:
+		t.Fatalf("reconfigure returned before worker joined: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case err := <-configured:
+		if err != nil {
+			t.Fatalf("reconfigure error = %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("reconfigure did not join timed-out host callback")
+	}
+	select {
+	case <-metadataDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("host metadata wrapper did not finish after worker join")
+	}
+	hostAuthInvoker = func() hostAuthListCallResult { return hostAuthListCallResult{code: 7} }
+	if _, err := hostAuthMetadata(); err == nil {
+		t.Fatal("host callback remained permanently fenced after reconfigure")
+	}
+}
+
+func mustJSON(value any) []byte {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		panic(err)
+	}
+	return raw
+}
+
+func TestAccountUsageJSONUsesUIContract(t *testing.T) {
+	account := AccountUsage{Key: "acct-hash", Limit: 4, Reserved: 1, InFlight: 2, WarmFlight: 1}
+	raw, err := json.Marshal(account)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]float64{"limit": 4, "reserved": 1, "in_flight": 2, "warm_flight": 1} {
+		got, ok := fields[key]
+		if !ok {
+			t.Fatalf("serialized AccountUsage missing %q: %s", key, raw)
+		}
+		if got != want {
+			t.Fatalf("serialized %s = %#v, want %v", key, got, want)
+		}
+	}
+	if _, ok := fields["key"]; ok {
+		t.Fatalf("serialized AccountUsage exposed authority key: %s", raw)
+	}
+}
+
+func TestAvailableIdleAccountsAreIncludedInSnapshot(t *testing.T) {
+	resetTestState()
+	oldInvoker, oldTimeout := hostAuthInvoker, hostAuthTimeout
+	t.Cleanup(func() {
+		hostAuthInvoker, hostAuthTimeout = oldInvoker, oldTimeout
+		resetTestState()
+	})
+	entries := []pluginapi.HostAuthFileEntry{
+		{ID: "idle-a", Email: "idle-a@example.com"},
+		{ID: "idle-b", Name: "idle-b.json"},
+	}
+	raw, _ := json.Marshal(envelope{OK: true, Result: mustJSON(hostAuthListResponse{Files: entries})})
+	hostAuthInvoker = func() hostAuthListCallResult { return hostAuthListCallResult{raw: raw} }
+
+	snapshot := readConcurrencySnapshot(context.Background())
+	if snapshot.Stale || snapshot.Error != "" {
+		t.Fatalf("idle snapshot unexpectedly stale: %#v", snapshot)
+	}
+	if snapshot.InFlight != 0 || !snapshot.Empty || snapshot.AccountsInUse != 0 {
+		t.Fatalf("idle aggregate = %#v", snapshot)
+	}
+	if snapshot.Summary.Total.InFlight != 0 || snapshot.Summary.Total.Limit != 4 || snapshot.Summary.WarmReserved.InFlight != 0 || snapshot.Summary.WarmReserved.Reserved != 2 {
+		t.Fatalf("idle summary = %#v", snapshot.Summary)
+	}
+	if len(snapshot.Accounts) != len(entries) {
+		t.Fatalf("idle accounts = %#v, want %d rows", snapshot.Accounts, len(entries))
+	}
+	for _, account := range snapshot.Accounts {
+		if account.InFlight != 0 || account.WarmFlight != 0 || account.Limit != 2 || account.Reserved != 1 {
+			t.Fatalf("idle account usage = %#v", account)
+		}
+		if account.Label == "" || account.Label == account.Key {
+			t.Fatalf("idle account label = %#v", account)
+		}
+	}
+}
+
+func TestAvailableMixedActiveAndIdleAccountsAreIncludedInSnapshot(t *testing.T) {
+	resetTestState()
+	oldInvoker, oldTimeout := hostAuthInvoker, hostAuthTimeout
+	t.Cleanup(func() {
+		hostAuthInvoker, hostAuthTimeout = oldInvoker, oldTimeout
+		resetTestState()
+	})
+	entries := []pluginapi.HostAuthFileEntry{
+		{ID: "active", Email: "active@example.com"},
+		{ID: "idle", Email: "idle@example.com"},
+	}
+	raw, _ := json.Marshal(envelope{OK: true, Result: mustJSON(hostAuthListResponse{Files: entries})})
+	hostAuthInvoker = func() hostAuthListCallResult { return hostAuthListCallResult{raw: raw} }
+	authority := state.authority.(*localAuthority)
+	lease, err := authority.Acquire(context.Background(), accountKey("cpa", "active"), 2, 1, classCold)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = authority.Release(context.Background(), lease) })
+
+	snapshot := readConcurrencySnapshot(context.Background())
+	if snapshot.Stale || snapshot.Error != "" {
+		t.Fatalf("mixed snapshot unexpectedly stale: %#v", snapshot)
+	}
+	if snapshot.InFlight != 1 || snapshot.Empty || snapshot.AccountsInUse != 1 {
+		t.Fatalf("mixed aggregate = %#v", snapshot)
+	}
+	if snapshot.Summary.Total.InFlight != 1 || snapshot.Summary.Total.Limit != 4 || snapshot.Summary.WarmReserved.InFlight != 0 || snapshot.Summary.WarmReserved.Reserved != 2 {
+		t.Fatalf("mixed summary = %#v", snapshot.Summary)
+	}
+	if len(snapshot.Accounts) != 2 {
+		t.Fatalf("mixed accounts = %#v, want active and idle rows", snapshot.Accounts)
+	}
+	for _, account := range snapshot.Accounts {
+		switch account.Label {
+		case "active@example.com":
+			if account.InFlight != 1 || account.WarmFlight != 0 {
+				t.Fatalf("active account usage = %#v", account)
+			}
+		case "idle@example.com":
+			if account.InFlight != 0 || account.WarmFlight != 0 {
+				t.Fatalf("idle account usage = %#v", account)
+			}
+		default:
+			t.Fatalf("unexpected account row = %#v", account)
+		}
+	}
+}
+
+type observabilityRedis struct {
+	mu    sync.Mutex
+	usage map[string][2]int64
+	calls []string
+	err   error
+}
+
+func (r *observabilityRedis) Eval(_ context.Context, script string, keys []string, _ ...any) (any, error) {
+	if script != redisSnapshotScript {
+		return []any{int64(0), int64(0), int64(0)}, nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.err != nil {
+		return nil, r.err
+	}
+	if len(keys) != 1 {
+		return nil, errors.New("snapshot key missing")
+	}
+	r.calls = append(r.calls, keys[0])
+	u := r.usage[keys[0]]
+	return []any{u[0], u[1], int64(0)}, nil
+}
+
+func TestRedisAvailableAccountsUseHostListingAndShowZeroUsage(t *testing.T) {
+	resetTestState()
+	oldInvoker, oldTimeout := hostAuthInvoker, hostAuthTimeout
+	t.Cleanup(func() { hostAuthInvoker, hostAuthTimeout = oldInvoker, oldTimeout; resetTestState() })
+	entries := []pluginapi.HostAuthFileEntry{{ID: "redis-active", Email: "active@example.com"}, {ID: "redis-idle", Name: "idle.json"}}
+	raw, _ := json.Marshal(envelope{OK: true, Result: mustJSON(hostAuthListResponse{Files: entries})})
+	hostAuthInvoker = func() hostAuthListCallResult { return hostAuthListCallResult{raw: raw} }
+	fake := &observabilityRedis{usage: make(map[string][2]int64)}
+	a := newRedisAuthority(fake, "obs")
+	activeKey := a.key(accountKey("cpa", "redis-active"))
+	fake.usage[activeKey] = [2]int64{2, 1}
+	state.mu.Lock()
+	state.cfg.MaxConcurrency, state.cfg.WarmReservedSlots, state.cfg.Authority = 5, 2, "redis"
+	state.authority = a
+	state.mu.Unlock()
+
+	snapshot := readConcurrencySnapshot(context.Background())
+	if snapshot.Stale || snapshot.Error != "" {
+		t.Fatalf("redis snapshot unexpectedly stale: %#v", snapshot)
+	}
+	if snapshot.InFlight != 2 || snapshot.WarmInFlight != 1 || len(snapshot.Accounts) != 2 {
+		t.Fatalf("redis snapshot = %#v", snapshot)
+	}
+	if snapshot.Summary.Total.InFlight != 2 || snapshot.Summary.Total.Limit != 10 || snapshot.Summary.WarmReserved.InFlight != 1 || snapshot.Summary.WarmReserved.Reserved != 4 {
+		t.Fatalf("redis summary = %#v", snapshot.Summary)
+	}
+	for _, account := range snapshot.Accounts {
+		switch account.Label {
+		case "active@example.com":
+			if account.InFlight != 2 || account.WarmFlight != 1 || account.Limit != 5 || account.Reserved != 2 {
+				t.Fatalf("redis active row = %#v", account)
+			}
+		case "idle.json":
+			if account.InFlight != 0 || account.WarmFlight != 0 {
+				t.Fatalf("redis idle row = %#v", account)
+			}
+		default:
+			t.Fatalf("unexpected redis row = %#v", account)
+		}
+	}
+	if len(fake.calls) != 2 {
+		t.Fatalf("redis snapshot calls = %v, want one per listed account", fake.calls)
+	}
+}
+
+func TestLocalSnapshotFiltersUnavailableRowsAndSumsAvailableOnly(t *testing.T) {
+	resetTestState()
+	oldInvoker, oldTimeout := hostAuthInvoker, hostAuthTimeout
+	t.Cleanup(func() { hostAuthInvoker, hostAuthTimeout = oldInvoker, oldTimeout; resetTestState() })
+	entries := []pluginapi.HostAuthFileEntry{
+		{ID: "local-a", Name: "usable-401.json", Status: "active"},
+		{ID: "local-b", Name: "needs-login.json", Status: "unauthorized"},
+		{ID: "local-c", Name: "disabled.json", Disabled: true},
+	}
+	raw := mustJSON(envelope{OK: true, Result: mustJSON(hostAuthListResponse{Files: entries})})
+	hostAuthInvoker = func() hostAuthListCallResult { return hostAuthListCallResult{raw: raw} }
+	state.mu.Lock()
+	state.cfg.MaxConcurrency, state.cfg.WarmReservedSlots = 3, 1
+	state.mu.Unlock()
+	a := state.authority.(*localAuthority)
+	lease, err := a.Acquire(context.Background(), accountKey("cpa", "local-a"), 3, 1, classWarm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = a.Release(context.Background(), lease) })
+	snapshot := readConcurrencySnapshot(context.Background())
+	if snapshot.Stale || len(snapshot.Accounts) != 1 {
+		t.Fatalf("local filtered snapshot = %#v", snapshot)
+	}
+	if snapshot.Accounts[0].Label != "usable-401.json" || snapshot.Accounts[0].InFlight != 1 {
+		t.Fatalf("local available row = %#v", snapshot.Accounts[0])
+	}
+	if snapshot.Summary.Total.InFlight != 1 || snapshot.Summary.Total.Limit != 3 || snapshot.Summary.WarmReserved.InFlight != 1 || snapshot.Summary.WarmReserved.Reserved != 1 {
+		t.Fatalf("local available summary = %#v", snapshot.Summary)
+	}
+}
+
+func TestRedisSnapshotFiltersUnavailableRowsAndSumsAvailableOnly(t *testing.T) {
+	resetTestState()
+	oldInvoker, oldTimeout := hostAuthInvoker, hostAuthTimeout
+	t.Cleanup(func() { hostAuthInvoker, hostAuthTimeout = oldInvoker, oldTimeout; resetTestState() })
+	entries := []pluginapi.HostAuthFileEntry{
+		{ID: "redis-a", Email: "usable@example.com", Status: "ready"},
+		{ID: "redis-b", Name: "authentication-failure-status.json", Status: "Authentication Failure"},
+		{ID: "redis-c", Name: "authentication-failure-message.json", StatusMessage: " authentication failure "},
+	}
+	raw := mustJSON(envelope{OK: true, Result: mustJSON(hostAuthListResponse{Files: entries})})
+	hostAuthInvoker = func() hostAuthListCallResult { return hostAuthListCallResult{raw: raw} }
+	fake := &observabilityRedis{usage: make(map[string][2]int64)}
+	a := newRedisAuthority(fake, "filtered")
+	fake.usage[a.key(accountKey("cpa", "redis-a"))] = [2]int64{2, 1}
+	state.mu.Lock()
+	state.cfg.MaxConcurrency, state.cfg.WarmReservedSlots, state.cfg.Authority = 4, 2, "redis"
+	state.authority = a
+	state.mu.Unlock()
+	snapshot := readConcurrencySnapshot(context.Background())
+	if snapshot.Stale || len(snapshot.Accounts) != 1 {
+		t.Fatalf("redis filtered snapshot = %#v", snapshot)
+	}
+	if snapshot.Accounts[0].Label != "usable@example.com" || snapshot.Accounts[0].InFlight != 2 || snapshot.Accounts[0].WarmFlight != 1 {
+		t.Fatalf("redis available row = %#v", snapshot.Accounts[0])
+	}
+	if snapshot.Summary.Total.InFlight != 2 || snapshot.Summary.Total.Limit != 4 || snapshot.Summary.WarmReserved.InFlight != 1 || snapshot.Summary.WarmReserved.Reserved != 2 {
+		t.Fatalf("redis available summary = %#v", snapshot.Summary)
+	}
+	if len(fake.calls) != 1 {
+		t.Fatalf("redis snapshot queried filtered accounts: %v", fake.calls)
+	}
+}
+
+func TestAccountListFailureNeverClaimsAvailableRows(t *testing.T) {
+	resetTestState()
+	oldInvoker, oldTimeout := hostAuthInvoker, hostAuthTimeout
+	t.Cleanup(func() { hostAuthInvoker, hostAuthTimeout = oldInvoker, oldTimeout; resetTestState() })
+	hostAuthInvoker = func() hostAuthListCallResult { return hostAuthListCallResult{code: 7} }
+	a := state.authority
+	lease, err := a.Acquire(context.Background(), accountKey("cpa", "hidden"), 2, 1, classWarm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = a.Release(context.Background(), lease) })
+	snapshot := readConcurrencySnapshot(context.Background())
+	if !snapshot.Stale || snapshot.Error == "" || len(snapshot.Accounts) != 0 {
+		t.Fatalf("failed host list snapshot = %#v", snapshot)
+	}
+	if snapshot.InFlight != 1 || snapshot.WarmInFlight != 1 {
+		t.Fatalf("local usage was not retained truthfully = %#v", snapshot)
+	}
+}
+
+func TestRedisAuthorityReadFailureLeavesRowsUnknown(t *testing.T) {
+	resetTestState()
+	oldInvoker, oldTimeout := hostAuthInvoker, hostAuthTimeout
+	t.Cleanup(func() { hostAuthInvoker, hostAuthTimeout = oldInvoker, oldTimeout; resetTestState() })
+	entry := pluginapi.HostAuthFileEntry{ID: "redis-fail", Name: "redis-fail.json"}
+	raw, _ := json.Marshal(envelope{OK: true, Result: mustJSON(hostAuthListResponse{Files: []pluginapi.HostAuthFileEntry{entry}})})
+	hostAuthInvoker = func() hostAuthListCallResult { return hostAuthListCallResult{raw: raw} }
+	a := newRedisAuthority(&observabilityRedis{usage: make(map[string][2]int64), err: errors.New("redis down")}, "obs")
+	state.mu.Lock()
+	state.cfg.Authority = "redis"
+	state.authority = a
+	state.mu.Unlock()
+	snapshot := readConcurrencySnapshot(context.Background())
+	if !snapshot.Stale || snapshot.AuthorityState != "unavailable" || len(snapshot.Accounts) != 0 {
+		t.Fatalf("failed authority snapshot = %#v", snapshot)
+	}
+}
+
+func TestManagementSnapshotReportsAuthorityUnavailableWithoutSecrets(t *testing.T) {
+	resetTestState()
+	state.mu.Lock()
+	state.authority = nil
+	state.cfg.RedisPassword = "do-not-leak"
+	state.cfg.Authority = "redis"
+	state.uncertain = true
+	state.mu.Unlock()
+	request, _ := json.Marshal(managementRPCRequest{ManagementRequest: pluginapi.ManagementRequest{Method: http.MethodGet, Path: managementUsagePath}})
+	out, err := handleMethod(pluginabi.MethodManagementHandle, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(out), "do-not-leak") {
+		t.Fatalf("snapshot leaked configuration secret: %s", out)
+	}
+	var env envelope
+	if err := json.Unmarshal(out, &env); err != nil {
+		t.Fatal(err)
+	}
+	var managementResp pluginapi.ManagementResponse
+	if err := json.Unmarshal(env.Result, &managementResp); err != nil {
+		t.Fatal(err)
+	}
+	var snapshot concurrencySnapshot
+	if err := json.Unmarshal(managementResp.Body, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if !snapshot.Stale || snapshot.AuthorityState != "unavailable" || snapshot.Error == "" {
+		t.Fatalf("unavailable snapshot = %#v", snapshot)
+	}
+}
+
+func TestManagementSnapshotRaceSafe(t *testing.T) {
+	resetTestState()
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				_ = readConcurrencySnapshot(context.Background())
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func TestHotReloadFailsClosedUntilInflightLeaseCompletes(t *testing.T) {
+	resetTestState()
+	first, _ := json.Marshal(testRequestInterceptRequest{RequestID: "reload", AuthID: "acct"})
+	if _, err := interceptAfter(first); err != nil {
+		t.Fatal(err)
+	}
+	cliproxyPluginShutdown()
+	config, _ := json.Marshal(lifecycleRequest{SchemaVersion: 4, ConfigYAML: []byte("authority: local\nmax_concurrency: 1\nwait_timeout: 1ms\n")})
+	if err := configure(config); err != nil {
+		t.Fatal(err)
+	}
+	second, _ := json.Marshal(testRequestInterceptRequest{RequestID: "new", AuthID: "acct"})
+	out, err := interceptAfter(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	_ = json.Unmarshal(out, &env)
+	var rejected pluginapi.RequestInterceptResponse
+	if env.OK {
+		_ = json.Unmarshal(env.Result, &rejected)
+	}
+	if !rejected.Terminate {
+		t.Fatal("reload admitted overlapping lease")
+	}
+	if _, err := complete([]byte(`{"request_id":"reload"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := interceptAfter(second); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPluginQuiesceDrainsInflightLeaseAndFencesAdmission(t *testing.T) {
+	resetTestState()
+	raw, _ := json.Marshal(testRequestInterceptRequest{RequestID: "drain", AuthID: "acct"})
+	if _, err := interceptAfter(raw); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		deadline := time.Now().Add(500 * time.Millisecond).UnixNano()
+		payload, _ := json.Marshal(quiesceRequest{DeadlineUnixNano: deadline})
+		_, err := handleMethod(pluginabi.MethodPluginQuiesce, payload)
+		result <- err
+	}()
+	// Quiescing must stop new work while allowing the old request to complete.
+	time.Sleep(10 * time.Millisecond)
+	newRaw, _ := json.Marshal(testRequestInterceptRequest{RequestID: "new", AuthID: "acct"})
+	out, err := interceptAfter(newRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	_ = json.Unmarshal(out, &env)
+	var rejected pluginapi.RequestInterceptResponse
+	_ = json.Unmarshal(env.Result, &rejected)
+	if !rejected.Terminate {
+		t.Fatal("admission succeeded while plugin was quiescing")
+	}
+	completion, _ := json.Marshal(pluginapi.RequestCompletion{RequestID: "drain"})
+	if _, err := complete(completion); err != nil {
+		t.Fatal(err)
+	}
+	state.mu.Lock()
+	remaining := len(state.leases)
+	state.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("leases after completion = %d", remaining)
+	}
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("quiesce error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("quiesce did not complete after lease drain")
+	}
+}
+
+func TestPluginQuiesceTimeoutLeavesAuthorityFenced(t *testing.T) {
+	resetTestState()
+	raw, _ := json.Marshal(testRequestInterceptRequest{RequestID: "stuck", AuthID: "acct"})
+	if _, err := interceptAfter(raw); err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(quiesceRequest{DeadlineUnixNano: time.Now().Add(10 * time.Millisecond).UnixNano()})
+	if _, err := handleMethod(pluginabi.MethodPluginQuiesce, payload); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("quiesce error = %v, want deadline exceeded", err)
+	}
+	newRaw, _ := json.Marshal(testRequestInterceptRequest{RequestID: "after-timeout", AuthID: "acct"})
+	out, err := interceptAfter(newRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	_ = json.Unmarshal(out, &env)
+	var rejected pluginapi.RequestInterceptResponse
+	_ = json.Unmarshal(env.Result, &rejected)
+	if !rejected.Terminate {
+		t.Fatal("admission succeeded after quiesce timeout")
+	}
+}
+
+func TestRedisReconfigureSwapsMaterialClientConfigWhenIdle(t *testing.T) {
+	resetTestState()
+	first, _ := json.Marshal(lifecycleRequest{SchemaVersion: 4, ConfigYAML: []byte("authority: redis\nredis_addr: 127.0.0.1:6379\nredis_password: one\nredis_db: 1\nredis_prefix: first\n")})
+	if err := configure(first); err != nil {
+		t.Fatal(err)
+	}
+	second, _ := json.Marshal(lifecycleRequest{SchemaVersion: 4, ConfigYAML: []byte("authority: redis\nredis_addr: 127.0.0.1:6380\nredis_password: two\nredis_db: 2\nredis_prefix: second\n")})
+	if err := configure(second); err != nil {
+		t.Fatal(err)
+	}
+	state.mu.Lock()
+	a, ok := state.authority.(*redisAuthority)
+	state.mu.Unlock()
+	if !ok {
+		t.Fatalf("authority type = %T", state.authority)
+	}
+	client, ok := a.client.(redisNetClient)
+	if !ok || client.addr != "127.0.0.1:6380" || client.password != "two" || client.db != 2 || a.prefix != "second" {
+		t.Fatalf("redis authority = %#v client=%#v", a, a.client)
+	}
+}
+
+type countingAuthority struct {
+	*localAuthority
+	mu       sync.Mutex
+	acquires int
+	releases int
+	renews   int
+}
+
+func (a *countingAuthority) Acquire(ctx context.Context, key string, limit, reserved int, class requestClass) (Lease, error) {
+	a.mu.Lock()
+	a.acquires++
+	a.mu.Unlock()
+	return a.localAuthority.Acquire(ctx, key, limit, reserved, class)
+}
+func (a *countingAuthority) Release(ctx context.Context, l Lease) error {
+	a.mu.Lock()
+	a.releases++
+	a.mu.Unlock()
+	return a.localAuthority.Release(ctx, l)
+}
+func (a *countingAuthority) Renew(ctx context.Context, l Lease) error {
+	a.mu.Lock()
+	a.renews++
+	a.mu.Unlock()
+	return a.localAuthority.Renew(ctx, l)
+}
+
+func TestLocalAuthorityHardCapAndExactlyOnceRelease(t *testing.T) {
+	a := newLocalAuthority()
+	first, err := a.Acquire(context.Background(), "a", 2, 1, classWarm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := a.Acquire(context.Background(), "a", 2, 1, classWarm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+	defer cancel()
+	if _, err = a.Acquire(ctx, "a", 2, 1, classWarm); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("third lease error = %v", err)
+	}
+	if err = a.Release(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	if err = a.Release(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	if err = a.Release(context.Background(), second); err != nil {
+		t.Fatal(err)
+	}
+	u, err := a.Snapshot(context.Background(), "a", 2, 1)
+	if err != nil || u.InFlight != 0 {
+		t.Fatalf("usage = %#v, err=%v", u, err)
+	}
+}
+
+func TestWarmReservationAndColdFairSelection(t *testing.T) {
+	a := newLocalAuthority()
+	warm, err := a.Acquire(context.Background(), accountKey("cpa", "a"), 4, 1, classWarm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err = a.Acquire(context.Background(), accountKey("cpa", "a"), 4, 1, classCold); err != nil {
+			t.Fatal(err)
+		}
+	}
+	chosen, err := chooseCandidate(context.Background(), a, []string{"a", "b"}, 4, 1, classCold)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if chosen != "b" {
+		t.Fatalf("cold selection = %q, want b", chosen)
+	}
+	if err = a.Release(context.Background(), warm); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSchedulerRejectsFullCapacityAndPreservesStrictAffinity(t *testing.T) {
+	resetTestState()
+	a := state.authority
+	for i := 0; i < 2; i++ {
+		if _, err := a.Acquire(context.Background(), accountKey("cpa", "strict"), 2, 1, classWarm); err != nil {
+			t.Fatal(err)
+		}
+	}
+	raw, _ := json.Marshal(pluginapi.SchedulerPickRequest{Options: pluginapi.SchedulerOptions{Metadata: map[string]any{"pinned_auth_id": "strict"}}, Candidates: []pluginapi.SchedulerAuthCandidate{{ID: "strict"}, {ID: "other"}}})
+	if _, err := schedulerPick(raw); err == nil {
+		t.Fatal("strict full scheduler unexpectedly succeeded")
+	}
+	resetTestState()
+	raw, _ = json.Marshal(pluginapi.SchedulerPickRequest{Options: pluginapi.SchedulerOptions{Metadata: map[string]any{"pinned_auth_id": "strict"}}, Candidates: []pluginapi.SchedulerAuthCandidate{{ID: "strict"}, {ID: "other"}}})
+	out, err := schedulerPick(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	_ = json.Unmarshal(out, &env)
+	var picked pluginapi.SchedulerPickResponse
+	_ = json.Unmarshal(env.Result, &picked)
+	if picked.AuthID != "strict" {
+		t.Fatalf("picked auth = %q", picked.AuthID)
+	}
+}
+
+func TestSelectedAccountBindingTransferAndCompletionRelease(t *testing.T) {
+	resetTestState()
+	before, _ := json.Marshal(testRequestInterceptRequest{RequestID: "r1", AuthID: "a"})
+	if _, err := interceptAfter(before); err != nil {
+		t.Fatal(err)
+	}
+	same, _ := json.Marshal(testRequestInterceptRequest{RequestID: "r1", AuthID: "a"})
+	if _, err := interceptAfter(same); err != nil {
+		t.Fatal(err)
+	}
+	transfer, _ := json.Marshal(testRequestInterceptRequest{RequestID: "r1", AuthID: "b"})
+	if _, err := interceptAfter(transfer); err != nil {
+		t.Fatal(err)
+	}
+	completion, _ := json.Marshal(pluginapi.RequestCompletion{RequestID: "r1", Outcome: pluginapi.RequestCompletionSucceeded})
+	if _, err := complete(completion); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := complete(completion); err != nil {
+		t.Fatal(err)
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if len(state.leases) != 0 || len(state.bound) != 0 {
+		t.Fatalf("leases after duplicate completion = %#v/%#v", state.leases, state.bound)
+	}
+}
+
+func TestFailedFailoverDoesNotLeaveStaleLeaseBinding(t *testing.T) {
+	resetTestState()
+	raw, _ := json.Marshal(testRequestInterceptRequest{RequestID: "r2", AuthID: "a"})
+	if _, err := interceptAfter(raw); err != nil {
+		t.Fatal(err)
+	}
+	// Fill account b so the failover attempt is rejected.
+	state.mu.Lock()
+	authority := state.authority
+	state.mu.Unlock()
+	for i := 0; i < 2; i++ {
+		if _, err := authority.Acquire(context.Background(), accountKey("cpa", "b"), 2, 1, classWarm); err != nil {
+			t.Fatal(err)
+		}
+	}
+	raw, _ = json.Marshal(testRequestInterceptRequest{RequestID: "r2", AuthID: "b"})
+	out, err := interceptAfter(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	_ = json.Unmarshal(out, &env)
+	var rejected pluginapi.RequestInterceptResponse
+	_ = json.Unmarshal(env.Result, &rejected)
+	if !rejected.Terminate {
+		t.Fatal("full failover account was not rejected")
+	}
+	raw, _ = json.Marshal(testRequestInterceptRequest{RequestID: "r2", AuthID: "a"})
+	out, err = interceptAfter(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = json.Unmarshal(out, &env)
+	var resumed pluginapi.RequestInterceptResponse
+	_ = json.Unmarshal(env.Result, &resumed)
+	if resumed.Terminate {
+		t.Fatal("retry on original account retained stale released binding")
+	}
+}
+
+func TestAdmissionResponseIsMachineReadable503(t *testing.T) {
+	raw, err := admissionResponse(&AdmissionError{Code: "account_concurrency_limit", HTTPStatus: http.StatusServiceUnavailable, RetryAfter: 1, Message: "account concurrency limit reached"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	_ = json.Unmarshal(raw, &env)
+	var resp pluginapi.RequestInterceptResponse
+	_ = json.Unmarshal(env.Result, &resp)
+	if !resp.Terminate || resp.StatusCode != http.StatusServiceUnavailable || resp.ResponseHeaders.Get("Retry-After") != "1" {
+		t.Fatalf("response = %#v", resp)
+	}
+	var body map[string]map[string]any
+	if err = json.Unmarshal(resp.ResponseBody, &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["error"]["code"] != "account_concurrency_limit" {
+		t.Fatalf("body = %s", resp.ResponseBody)
+	}
+}
+
+func TestAuthorityFailureFailsClosed(t *testing.T) {
+	resetTestState()
+	state.mu.Lock()
+	state.authority = nil
+	state.cfg.Authority = "redis"
+	state.mu.Unlock()
+	raw, _ := json.Marshal(testRequestInterceptRequest{RequestID: "r", AuthID: "a"})
+	out, err := interceptAfter(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	_ = json.Unmarshal(out, &env)
+	var resp pluginapi.RequestInterceptResponse
+	_ = json.Unmarshal(env.Result, &resp)
+	if !resp.Terminate || resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("resp = %#v", resp)
+	}
+}
+
+func TestSelectedAuthMetadataIsColdUnlessVerifiedBinding(t *testing.T) {
+	resetTestState()
+	selected, _ := json.Marshal(testRequestInterceptRequest{RequestID: "cold", AuthID: "acct", Metadata: map[string]any{"selected_auth_id": "acct"}})
+	if _, err := interceptAfter(selected); err != nil {
+		t.Fatal(err)
+	}
+	state.mu.Lock()
+	if got := state.requests["cold"].lease.Class; got != classCold {
+		state.mu.Unlock()
+		t.Fatalf("selected-auth lease class = %v, want cold", got)
+	}
+	state.mu.Unlock()
+	verified, _ := json.Marshal(testRequestInterceptRequest{RequestID: "warm", AuthID: "acct", Metadata: map[string]any{"cache_auth_id": "acct", "cache_verified": true}})
+	if _, err := interceptAfter(verified); err != nil {
+		t.Fatal(err)
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if got := state.requests["warm"].lease.Class; got != classWarm {
+		t.Fatalf("verified cache lease class = %v, want warm", got)
+	}
+}
+
+func TestPinnedAuthIsWarm(t *testing.T) {
+	resetTestState()
+	raw, _ := json.Marshal(testRequestInterceptRequest{RequestID: "pinned", AuthID: "acct", Metadata: map[string]any{"pinned_auth_id": "acct"}})
+	if _, err := interceptAfter(raw); err != nil {
+		t.Fatal(err)
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if got := state.requests["pinned"].lease.Class; got != classWarm {
+		t.Fatalf("pinned lease class = %v, want warm", got)
+	}
+}
+
+func TestVerifiedBindingDoesNotMakeColdFailoverWarm(t *testing.T) {
+	resetTestState()
+	first, _ := json.Marshal(testRequestInterceptRequest{RequestID: "retry", AuthID: "a", Metadata: map[string]any{"cache_auth_id": "a", "cache_verified": true}})
+	if _, err := interceptAfter(first); err != nil {
+		t.Fatal(err)
+	}
+	retry, _ := json.Marshal(testRequestInterceptRequest{RequestID: "retry", AuthID: "b", Metadata: map[string]any{"cache_auth_id": "a", "cache_verified": true, "selected_auth_id": "b"}})
+	if _, err := interceptAfter(retry); err != nil {
+		t.Fatal(err)
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if got := state.requests["retry"].lease.Class; got != classCold {
+		t.Fatalf("failover lease class = %v, want cold", got)
+	}
+}
+
+type typedCapacityAuthority struct {
+	*localAuthority
+	mu   sync.Mutex
+	full bool
+}
+
+type renewalFailureAuthority struct {
+	*countingAuthority
+}
+
+func (a *renewalFailureAuthority) Renew(context.Context, Lease) error {
+	a.mu.Lock()
+	a.renews++
+	a.mu.Unlock()
+	return errors.New("renew transport failed")
+}
+
+func (a *typedCapacityAuthority) Acquire(ctx context.Context, key string, limit, reserved int, class requestClass) (Lease, error) {
+	a.mu.Lock()
+	full := a.full
+	a.mu.Unlock()
+	if full {
+		return Lease{}, &AdmissionError{Code: "account_concurrency_limit", HTTPStatus: http.StatusServiceUnavailable, RetryAfter: 1, Message: "account concurrency limit reached"}
+	}
+	return a.localAuthority.Acquire(ctx, key, limit, reserved, class)
+}
+
+func TestCapacityRejectionDoesNotPoisonAuthorityAndRecoversAfterRelease(t *testing.T) {
+	resetTestState()
+	base := newLocalAuthority()
+	hold, err := base.Acquire(context.Background(), accountKey("cpa", "acct"), 2, 1, classWarm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &typedCapacityAuthority{localAuthority: base, full: true}
+	state.mu.Lock()
+	state.authority = a
+	state.mu.Unlock()
+	raw, _ := json.Marshal(testRequestInterceptRequest{RequestID: "capacity-1", AuthID: "acct"})
+	for i := 0; i < 2; i++ {
+		out, err := interceptAfter(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var env envelope
+		_ = json.Unmarshal(out, &env)
+		var resp pluginapi.RequestInterceptResponse
+		_ = json.Unmarshal(env.Result, &resp)
+		if !resp.Terminate || resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("capacity response = %#v", resp)
+		}
+		state.mu.Lock()
+		uncertain := state.uncertain
+		state.mu.Unlock()
+		if uncertain {
+			t.Fatal("typed capacity rejection poisoned authority")
+		}
+	}
+	a.mu.Lock()
+	a.full = false
+	a.mu.Unlock()
+	if err := base.Release(context.Background(), hold); err != nil {
+		t.Fatal(err)
+	}
+	out, err := interceptAfter(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	_ = json.Unmarshal(out, &env)
+	var resp pluginapi.RequestInterceptResponse
+	_ = json.Unmarshal(env.Result, &resp)
+	if resp.Terminate {
+		t.Fatalf("admission did not recover after capacity release: %#v", resp)
+	}
+}
+
+func TestEmptyRequestIDIsRejectedWithoutLease(t *testing.T) {
+	resetTestState()
+	raw, _ := json.Marshal(testRequestInterceptRequest{AuthID: "acct"})
+	out, err := interceptAfter(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	_ = json.Unmarshal(out, &env)
+	var resp pluginapi.RequestInterceptResponse
+	_ = json.Unmarshal(env.Result, &resp)
+	if !resp.Terminate || resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("empty request id response = %#v", resp)
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if len(state.leases) != 0 || len(state.requests) != 0 {
+		t.Fatalf("empty request id created state: leases=%d requests=%d", len(state.leases), len(state.requests))
+	}
+}
+
+func TestAuthIDWhitespaceAliasIsStable(t *testing.T) {
+	resetTestState()
+	first, _ := json.Marshal(testRequestInterceptRequest{RequestID: "alias", AuthID: " acct "})
+	if _, err := interceptAfter(first); err != nil {
+		t.Fatal(err)
+	}
+	second, _ := json.Marshal(testRequestInterceptRequest{RequestID: "alias", AuthID: "acct"})
+	if _, err := interceptAfter(second); err != nil {
+		t.Fatal(err)
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if got := state.bound["alias"]; got != "acct" {
+		t.Fatalf("canonical bound auth = %q", got)
+	}
+}
+
+func TestStockSelectedAuthMetadataDrivesSharedAccountAdmissionAndRelease(t *testing.T) {
+	resetTestState()
+	base := newLocalAuthority()
+	a := &countingAuthority{localAuthority: base}
+	state.mu.Lock()
+	state.authority = a
+	state.cfg.MaxConcurrency = 1
+	state.cfg.WarmReservedSlots = 0
+	state.cfg.WaitTimeout = 2 * time.Millisecond
+	state.mu.Unlock()
+
+	// This is the stock CPA post-auth shape: no AuthID field, with the selected
+	// account carried in request metadata.
+	first, _ := json.Marshal(testRequestInterceptRequest{RequestID: "stock-1", Model: "model-a", Metadata: map[string]any{"selected_auth_id": "acct-stock"}})
+	if _, err := interceptAfter(first); err != nil {
+		t.Fatal(err)
+	}
+	second, _ := json.Marshal(testRequestInterceptRequest{RequestID: "stock-2", Model: "model-b", Metadata: map[string]any{"selected_auth_id": "acct-stock"}})
+	out, err := interceptAfter(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	if err := json.Unmarshal(out, &env); err != nil {
+		t.Fatal(err)
+	}
+	var rejected pluginapi.RequestInterceptResponse
+	if err := json.Unmarshal(env.Result, &rejected); err != nil {
+		t.Fatal(err)
+	}
+	if !rejected.Terminate || rejected.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("second model bypassed shared account cap: %#v", rejected)
+	}
+	if strings.Contains(string(rejected.ResponseBody), "acct-stock") {
+		t.Fatalf("admission response leaked selected account: %s", rejected.ResponseBody)
+	}
+
+	completion, _ := json.Marshal(pluginapi.RequestCompletion{RequestID: "stock-1", Outcome: pluginapi.RequestCompletionSucceeded})
+	if _, err := complete(completion); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := complete(completion); err != nil {
+		t.Fatal(err)
+	}
+	a.mu.Lock()
+	acquires, releases := a.acquires, a.releases
+	a.mu.Unlock()
+	if acquires != 2 || releases != 1 {
+		t.Fatalf("metadata lease lifecycle acquire/release = %d/%d, want 2/1", acquires, releases)
+	}
+}
+
+func TestExplicitAuthIDCompatibilityAndIdentityFailuresFailClosed(t *testing.T) {
+	resetTestState()
+	legacy, _ := json.Marshal(testRequestInterceptRequest{RequestID: "legacy", AuthID: "legacy-acct"})
+	if _, err := interceptAfter(legacy); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := complete([]byte(`{"request_id":"legacy"}`)); err != nil {
+		t.Fatal(err)
+	}
+
+	requestIDs := map[string]string{"missing": "missing", "empty_selected": "empty-selected", "contradictory": "contradictory", "malformed": "malformed"}
+	for name, payload := range map[string][]byte{
+		"missing":        []byte(`{"RequestID":"missing","Model":"m"}`),
+		"empty_selected": []byte(`{"RequestID":"empty-selected","Metadata":{"selected_auth_id":"   "}}`),
+		"contradictory":  []byte(`{"RequestID":"contradictory","AuthID":"secret-explicit","Metadata":{"selected_auth_id":"secret-selected"}}`),
+		"malformed":      []byte(`{"RequestID":"malformed","Metadata":{"selected_auth_id":42}}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			out, err := interceptAfter(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var env envelope
+			if err := json.Unmarshal(out, &env); err != nil {
+				t.Fatal(err)
+			}
+			var rejected pluginapi.RequestInterceptResponse
+			if err := json.Unmarshal(env.Result, &rejected); err != nil {
+				t.Fatal(err)
+			}
+			if !rejected.Terminate || rejected.StatusCode != http.StatusServiceUnavailable {
+				t.Fatalf("identity failure passed through: %#v", rejected)
+			}
+			body := string(rejected.ResponseBody)
+			for _, secret := range []string{"secret-explicit", "secret-selected"} {
+				if strings.Contains(body, secret) {
+					t.Fatalf("identity failure leaked %q: %s", secret, body)
+				}
+			}
+			state.mu.Lock()
+			_, tracked := state.requests[requestIDs[name]]
+			state.mu.Unlock()
+			if tracked {
+				t.Fatal("identity failure left a request lifecycle record")
+			}
+		})
+	}
+}
+
+func TestRenewalFailureFencesUntilCompletion(t *testing.T) {
+	resetTestState()
+	base := &countingAuthority{localAuthority: newLocalAuthority()}
+	a := &renewalFailureAuthority{countingAuthority: base}
+	state.mu.Lock()
+	state.authority = a
+	state.mu.Unlock()
+	raw, _ := json.Marshal(testRequestInterceptRequest{RequestID: "fenced", AuthID: "acct"})
+	if _, err := interceptAfter(raw); err != nil {
+		t.Fatal(err)
+	}
+	state.mu.Lock()
+	rs := state.requests["fenced"]
+	state.mu.Unlock()
+	startHeartbeatWithInterval(rs, a, rs.lease, time.Millisecond)
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		rs.mu.Lock()
+		fenced := rs.fenced
+		rs.mu.Unlock()
+		if fenced {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	rs.mu.Lock()
+	fenced := rs.fenced
+	rs.mu.Unlock()
+	if !fenced {
+		t.Fatal("renewal failure did not fence request")
+	}
+	state.mu.Lock()
+	uncertain, leaseCount := state.uncertain, len(state.leases)
+	if !uncertain || leaseCount != 1 {
+		state.mu.Unlock()
+		t.Fatalf("fenced state uncertain=%v leases=%d", uncertain, leaseCount)
+	}
+	state.mu.Unlock()
+	completion, _ := json.Marshal(pluginapi.RequestCompletion{RequestID: "fenced"})
+	if _, err := complete(completion); err != nil {
+		t.Fatal(err)
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if len(state.leases) != 0 {
+		t.Fatalf("lease retained after fenced completion: %d", len(state.leases))
+	}
+}
+
+type renewalFenceAuthority struct {
+	*renewalFailureAuthority
+	fenced chan Lease
+}
+
+func (a *renewalFenceAuthority) Fence(_ context.Context, lease Lease) error {
+	select {
+	case a.fenced <- lease:
+	default:
+	}
+	return nil
+}
+
+func TestRenewalLossAttemptsDistributedFence(t *testing.T) {
+	resetTestState()
+	base := &countingAuthority{localAuthority: newLocalAuthority()}
+	a := &renewalFenceAuthority{renewalFailureAuthority: &renewalFailureAuthority{countingAuthority: base}, fenced: make(chan Lease, 1)}
+	state.mu.Lock()
+	state.authority = a
+	state.mu.Unlock()
+	raw, _ := json.Marshal(testRequestInterceptRequest{RequestID: "fence-distributed", AuthID: "acct"})
+	if _, err := interceptAfter(raw); err != nil {
+		t.Fatal(err)
+	}
+	state.mu.Lock()
+	rs := state.requests["fence-distributed"]
+	lease := rs.lease
+	state.mu.Unlock()
+	startHeartbeatWithInterval(rs, a, lease, time.Millisecond)
+	select {
+	case got := <-a.fenced:
+		if got.Token != lease.Token {
+			t.Fatalf("fenced token = %q, want %q", got.Token, lease.Token)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("renewal loss did not invoke distributed fence")
+	}
+}
+
+type deadlineAuthority struct {
+	deadlineSeen bool
+}
+
+func (a *deadlineAuthority) Snapshot(ctx context.Context, _ string, _, _ int) (Usage, error) {
+	_, a.deadlineSeen = ctx.Deadline()
+	return Usage{}, ErrAuthorityUnavailable
+}
+func (a *deadlineAuthority) Acquire(context.Context, string, int, int, requestClass) (Lease, error) {
+	return Lease{}, ErrAuthorityUnavailable
+}
+func (a *deadlineAuthority) Release(ctx context.Context, _ Lease) error {
+	_, a.deadlineSeen = ctx.Deadline()
+	return ErrAuthorityUnavailable
+}
+func (a *deadlineAuthority) Renew(ctx context.Context, _ Lease) error {
+	_, a.deadlineSeen = ctx.Deadline()
+	return ErrAuthorityUnavailable
+}
+
+func TestSchedulerAuthorityCallHasDeadline(t *testing.T) {
+	resetTestState()
+	a := &deadlineAuthority{}
+	state.mu.Lock()
+	state.authority = a
+	state.mu.Unlock()
+	raw, _ := json.Marshal(pluginapi.SchedulerPickRequest{Candidates: []pluginapi.SchedulerAuthCandidate{{ID: "acct"}}})
+	if _, err := schedulerPick(raw); err == nil {
+		t.Fatal("scheduler unexpectedly admitted with unavailable authority")
+	}
+	if !a.deadlineSeen {
+		t.Fatal("scheduler authority call had no deadline")
+	}
+}
+
+func TestReconfigureDoesNotClearUncertaintyWithTrackedLease(t *testing.T) {
+	resetTestState()
+	raw, _ := json.Marshal(testRequestInterceptRequest{RequestID: "uncertain", AuthID: "acct"})
+	if _, err := interceptAfter(raw); err != nil {
+		t.Fatal(err)
+	}
+	markAuthorityUncertain()
+	config, _ := json.Marshal(lifecycleRequest{SchemaVersion: 4, ConfigYAML: []byte("max_concurrency: 2\nwait_timeout: 1ms\nauthority: local\n")})
+	if err := configure(config); err != nil {
+		t.Fatal(err)
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if !state.uncertain {
+		t.Fatal("reconfigure cleared uncertainty while lease remained tracked")
+	}
+}
+
+func TestReconfigureShutdownAndLateCallbacksRaceSafely(t *testing.T) {
+	resetTestState()
+	raw, _ := json.Marshal(testRequestInterceptRequest{RequestID: "race", AuthID: "acct"})
+	config, _ := json.Marshal(lifecycleRequest{SchemaVersion: 4, ConfigYAML: []byte("max_concurrency: 2\nwait_timeout: 1ms\nauthority: local\n")})
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(3)
+		go func() {
+			defer wg.Done()
+			_, _ = interceptAfter(raw)
+		}()
+		go func() {
+			defer wg.Done()
+			_, _ = complete([]byte(`{"request_id":"race"}`))
+		}()
+		go func() {
+			defer wg.Done()
+			_ = configure(config)
+		}()
+	}
+	shutdownDone := make(chan struct{})
+	go func() {
+		cliproxyPluginShutdown()
+		close(shutdownDone)
+	}()
+	wg.Wait()
+	<-shutdownDone
+}
+
+func TestDefaultReservationFormula(t *testing.T) {
+	for limit, want := range map[int]int{1: 0, 2: 1, 5: 1, 6: 2, 10: 2} {
+		resetTestState()
+		raw, _ := json.Marshal(lifecycleRequest{SchemaVersion: 4, ConfigYAML: []byte("max_concurrency: " + fmt.Sprint(limit) + "\nwait_timeout: 10ms\n")})
+		if err := configure(raw); err != nil {
+			t.Fatalf("limit %d configure: %v", limit, err)
+		}
+		state.mu.Lock()
+		got := state.cfg.WarmReservedSlots
+		state.mu.Unlock()
+		if got != want {
+			t.Fatalf("limit %d reservation = %d, want %d", limit, got, want)
+		}
+	}
+}
+
+func TestConcurrentCallbacksSerializePerRequest(t *testing.T) {
+	resetTestState()
+	a := &countingAuthority{localAuthority: newLocalAuthority()}
+	state.mu.Lock()
+	state.authority = a
+	state.mu.Unlock()
+	raw, _ := json.Marshal(testRequestInterceptRequest{RequestID: "concurrent", AuthID: "acct"})
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); _, _ = interceptAfter(raw) }()
+	}
+	wg.Wait()
+	a.mu.Lock()
+	gotAcquire, gotRelease := a.acquires, a.releases
+	a.mu.Unlock()
+	if gotAcquire != 1 || gotRelease != 0 {
+		t.Fatalf("duplicate callbacks acquire/release = %d/%d, want 1/0", gotAcquire, gotRelease)
+	}
+	completion, _ := json.Marshal(pluginapi.RequestCompletion{RequestID: "concurrent"})
+	_, _ = complete(completion)
+	a.mu.Lock()
+	gotRelease = a.releases
+	a.mu.Unlock()
+	if gotRelease != 1 {
+		t.Fatalf("completion releases = %d, want 1", gotRelease)
+	}
+}
+
+func TestCompletionTombstonePreventsLateAcquire(t *testing.T) {
+	resetTestState()
+	a := &countingAuthority{localAuthority: newLocalAuthority()}
+	state.mu.Lock()
+	state.authority = a
+	state.mu.Unlock()
+	completion, _ := json.Marshal(pluginapi.RequestCompletion{RequestID: "late"})
+	if _, err := complete(completion); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(testRequestInterceptRequest{RequestID: "late", AuthID: "acct"})
+	if _, err := interceptAfter(raw); err != nil {
+		t.Fatal(err)
+	}
+	a.mu.Lock()
+	got := a.acquires
+	a.mu.Unlock()
+	if got != 0 {
+		t.Fatalf("late callback acquired %d leases", got)
+	}
+}
+
+func TestShutdownMarksRequestsTerminalAndRejectsAdmission(t *testing.T) {
+	resetTestState()
+	a := &countingAuthority{localAuthority: newLocalAuthority()}
+	state.mu.Lock()
+	state.authority = a
+	state.mu.Unlock()
+	raw, _ := json.Marshal(testRequestInterceptRequest{RequestID: "shutdown", AuthID: "acct"})
+	if _, err := interceptAfter(raw); err != nil {
+		t.Fatal(err)
+	}
+	cliproxyPluginShutdown()
+	if _, err := interceptAfter(raw); err != nil {
+		t.Fatal(err)
+	}
+	a.mu.Lock()
+	acquires, releases := a.acquires, a.releases
+	a.mu.Unlock()
+	if acquires != 1 || releases != 1 {
+		t.Fatalf("shutdown acquire/release = %d/%d, want 1/1", acquires, releases)
+	}
+}
+
+func TestRedisLeaseLifecycleArgumentsAndIdempotentRelease(t *testing.T) {
+	f := &recordingRedis{}
+	a := newRedisAuthority(f, "cpa:test")
+	l, err := a.Acquire(context.Background(), "acct", 2, 1, classWarm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.acquireTTL <= 0 {
+		t.Fatalf("acquire ttl = %d", f.acquireTTL)
+	}
+	if err := a.Renew(context.Background(), l); err != nil {
+		t.Fatal(err)
+	}
+	if f.renewTTL <= 0 {
+		t.Fatalf("renew ttl = %d", f.renewTTL)
+	}
+	if err := a.Release(context.Background(), l); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Release(context.Background(), l); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRedisFakeExpiryRenewalAndCrashRecovery(t *testing.T) {
+	f := newLeaseFakeRedis()
+	a := newRedisAuthority(f, "cpa:test")
+	one, err := a.Acquire(context.Background(), "acct", 1, 0, classWarm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = a.Acquire(context.Background(), "acct", 1, 0, classWarm); err == nil {
+		t.Fatal("second acquire exceeded fake hard cap")
+	}
+	f.expire(one.Token)
+	if _, err = a.Acquire(context.Background(), "acct", 1, 0, classWarm); !errors.Is(err, ErrAuthorityUnavailable) {
+		t.Fatalf("expired lease acquire error = %v, want authority unavailable", err)
+	}
+	if err = a.Release(context.Background(), one); err != nil {
+		t.Fatal(err)
+	}
+	// A live lease is extended by renewal and remains occupied.
+	live, err := a.Acquire(context.Background(), "other", 2, 0, classWarm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = a.Renew(context.Background(), live); err != nil {
+		t.Fatal(err)
+	}
+	f.expire(live.Token)
+	if err = a.Renew(context.Background(), live); err == nil {
+		t.Fatal("renewal unexpectedly revived an expired lease")
+	}
+	if err = a.Release(context.Background(), live); err != nil {
+		t.Fatal(err)
+	}
+	if err = a.Release(context.Background(), live); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type recordingRedis struct {
+	acquireTTL, renewTTL int64
+	released             int
+}
+
+type fencedRedis struct{}
+
+func (fencedRedis) Eval(_ context.Context, script string, _ []string, _ ...any) (any, error) {
+	if script == redisAcquireScript {
+		return int64(-1), nil
+	}
+	return []any{int64(0), int64(0), int64(0)}, nil
+}
+
+func TestRedisAcquireAfterExpiryFenceFailsClosedForAnotherInstance(t *testing.T) {
+	a := newRedisAuthority(fencedRedis{}, "cpa:test")
+	lease, err := a.Acquire(context.Background(), "acct", 1, 0, classWarm)
+	if lease.Token != "" {
+		t.Fatalf("fenced acquire returned lease %#v", lease)
+	}
+	if !errors.Is(err, ErrAuthorityUnavailable) {
+		t.Fatalf("fenced acquire error = %v, want authority unavailable", err)
+	}
+}
+
+func TestRedisAcquireFenceProducesTypedAuthorityUnavailable(t *testing.T) {
+	resetTestState()
+	state.mu.Lock()
+	state.authority = newRedisAuthority(fencedRedis{}, "cpa:test")
+	state.mu.Unlock()
+
+	raw, _ := json.Marshal(testRequestInterceptRequest{RequestID: "fenced", AuthID: "acct"})
+	out, err := interceptAfter(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	if err := json.Unmarshal(out, &env); err != nil {
+		t.Fatal(err)
+	}
+	var resp pluginapi.RequestInterceptResponse
+	if err := json.Unmarshal(env.Result, &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.Terminate || resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("fenced response = %#v", resp)
+	}
+	var body map[string]map[string]any
+	if err := json.Unmarshal(resp.ResponseBody, &body); err != nil {
+		t.Fatal(err)
+	}
+	if got := body["error"]["type"]; got != "account_concurrency_authority_unavailable" {
+		t.Fatalf("fenced error type = %v", got)
+	}
+	if got := body["error"]["code"]; got != "account_concurrency_authority_unavailable" {
+		t.Fatalf("fenced error code = %v", got)
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if len(state.leases) != 0 {
+		t.Fatalf("fenced admission created leases: %#v", state.leases)
+	}
+	if got := state.requests["fenced"].lease; got.Token != "" {
+		t.Fatalf("fenced request retained lease %#v", got)
+	}
+	if !state.uncertain {
+		t.Fatal("fenced authority failure did not preserve fail-closed uncertainty")
+	}
+}
+
+func (f *recordingRedis) Eval(_ context.Context, script string, _ []string, args ...any) (any, error) {
+	switch script {
+	case redisAcquireScript:
+		f.acquireTTL, _ = toInt64(args[5])
+		return int64(1), nil
+	case redisRenewScript:
+		f.renewTTL, _ = toInt64(args[2])
+		return int64(1), nil
+	case redisReleaseScript:
+		f.released++
+		return int64(0), nil
+	default:
+		return []any{int64(0), int64(0)}, nil
+	}
+}
+func toInt64(v any) (int64, bool) {
+	switch n := v.(type) {
+	case int64:
+		return n, true
+	case int:
+		return int64(n), true
+	default:
+		return 0, false
+	}
+}
+
+type fakeRedisEntry struct {
+	class  int
+	expiry int64
+}
+type leaseFakeRedis struct {
+	mu      sync.Mutex
+	entries map[string]fakeRedisEntry
+	fenced  bool
+}
+
+func newLeaseFakeRedis() *leaseFakeRedis {
+	return &leaseFakeRedis{entries: make(map[string]fakeRedisEntry)}
+}
+func (f *leaseFakeRedis) expire(token string) {
+	f.mu.Lock()
+	if e, ok := f.entries[token]; ok {
+		e.expiry = 0
+		f.entries[token] = e
+	}
+	f.mu.Unlock()
+}
+func (f *leaseFakeRedis) clean(now int64) {
+	for token, e := range f.entries {
+		if e.expiry <= now {
+			f.fenced = true
+			_ = token
+		}
+	}
+}
+func (f *leaseFakeRedis) Eval(_ context.Context, script string, keys []string, args ...any) (any, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	now := time.Now().UnixMilli()
+	if len(args) > 4 {
+		if n, ok := toInt64(args[4]); ok {
+			now = n
+		}
+	}
+	f.clean(now)
+	switch script {
+	case redisAcquireScript:
+		if f.fenced {
+			return int64(-1), nil
+		}
+		limit, _ := toInt64(args[0])
+		reserved, _ := toInt64(args[1])
+		class, _ := toInt64(args[2])
+		token, _ := args[3].(string)
+		ttl, _ := toInt64(args[5])
+		allowed := limit
+		if class == 0 && limit-reserved > 0 {
+			allowed = limit - reserved
+		}
+		if int64(len(f.entries)) >= allowed {
+			return int64(0), nil
+		}
+		f.entries[token] = fakeRedisEntry{class: int(class), expiry: now + ttl}
+		return int64(1), nil
+	case redisRenewScript:
+		token, _ := args[0].(string)
+		now, _ := toInt64(args[1])
+		ttl, _ := toInt64(args[2])
+		e, ok := f.entries[token]
+		if !ok || e.expiry <= now {
+			return int64(0), nil
+		}
+		e.expiry = now + ttl
+		f.entries[token] = e
+		return int64(1), nil
+	case redisReleaseScript:
+		token, _ := args[0].(string)
+		if _, ok := f.entries[token]; !ok {
+			return int64(0), nil
+		}
+		delete(f.entries, token)
+		if len(f.entries) == 0 {
+			f.fenced = false
+		}
+		return int64(1), nil
+	case redisSnapshotScript:
+		warm := 0
+		for _, e := range f.entries {
+			if e.class == 1 {
+				warm++
+			}
+		}
+		fenced := int64(0)
+		if f.fenced {
+			fenced = 1
+		}
+		return []any{int64(len(f.entries)), int64(warm), fenced}, nil
+	default:
+		_ = keys
+		return nil, errors.New("unknown script")
+	}
+}

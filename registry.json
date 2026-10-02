@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "cpa-oauth-concurrency",
+      "name": "凭证并发管理",
+      "description": "按凭证限制并发请求，支持缓存亲和、共享并发控制和实时用量查看。",
+      "author": "tsunheimat",
+      "version": "0.0.1",
+      "repository": "https://github.com/darvintang/CPA-OAuth-Concurrency",
+      "homepage": "https://github.com/darvintang/CPA-OAuth-Concurrency",
+      "license": "MIT",
+      "tags": [
+        "cpa",
+        "concurrency",
+        "admission",
+        "prompt-cache"
+      ]
+    }
+  ]
+}
