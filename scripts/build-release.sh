@@ -57,13 +57,16 @@ CGO_ENABLED=1 GOOS="$target_goos" GOARCH="$target_goarch" \
   go build -trimpath -buildmode=c-shared -ldflags='-buildid=' \
   -o "$artifact_dir/$library" .
 
+# Publish registry metadata alongside the binary and cover it with the same checksum file.
+cp registry.json "$artifact_dir/registry.json"
+
 (
   cd "$artifact_dir"
   zip -X -q -9 "$archive" "$library"
   if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$archive" > checksums.txt
+    sha256sum "$archive" registry.json > checksums.txt
   else
-    shasum -a 256 "$archive" > checksums.txt
+    shasum -a 256 "$archive" registry.json > checksums.txt
   fi
   test "$(unzip -Z1 "$archive")" = "$library"
 )

@@ -62,9 +62,12 @@ if [[ "$zip_count" != "5" ]]; then
   exit 1
 fi
 
+# Keep the released registry identical to the source used for these binaries.
+cp "$(dirname "${BASH_SOURCE[0]}")/../registry.json" "$artifact_dir/registry.json"
+
 (
   cd "$artifact_dir"
-  sha256sum cpa-oauth-manager_*.zip > checksums.txt
+  sha256sum cpa-oauth-manager_*.zip registry.json > checksums.txt
   sha256sum --check checksums.txt
 )
 

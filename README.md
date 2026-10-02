@@ -153,6 +153,7 @@ cpa-oauth-manager_0.0.1_linux_arm64.zip
 cpa-oauth-manager_0.0.1_darwin_amd64.zip
 cpa-oauth-manager_0.0.1_darwin_arm64.zip
 cpa-oauth-manager_0.0.1_windows_amd64.zip
+registry.json
 checksums.txt
 ```
 

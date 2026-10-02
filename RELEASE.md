@@ -44,6 +44,7 @@ cpa-oauth-manager_X.Y.Z_linux_arm64.zip
 cpa-oauth-manager_X.Y.Z_darwin_amd64.zip
 cpa-oauth-manager_X.Y.Z_darwin_arm64.zip
 cpa-oauth-manager_X.Y.Z_windows_amd64.zip
+registry.json
 checksums.txt
 ```
 
