@@ -63,7 +63,7 @@ func TestPluginRegistrationIncludesRequiredRepositoryMetadata(t *testing.T) {
 	if reg.Metadata.GitHubRepository != "https://github.com/darvintang/CPAOAuthManager" {
 		t.Fatalf("GitHubRepository = %q", reg.Metadata.GitHubRepository)
 	}
-	if reg.Metadata.Name != "凭证并发管理" || reg.Metadata.Version != "0.0.1" || reg.Metadata.Author != "tsunheimat" || !reg.Capabilities.Scheduler || !reg.Capabilities.RequestInterceptorEnforcesAdmission {
+	if reg.Metadata.Name != "凭证并发管理" || reg.Metadata.Version != "0.0.1" || reg.Metadata.Author != "darvintang" || !reg.Capabilities.Scheduler || !reg.Capabilities.RequestInterceptorEnforcesAdmission {
 		t.Fatalf("registration = %#v", reg)
 	}
 	if !reg.Capabilities.ManagementAPI {

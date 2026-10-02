@@ -811,8 +811,9 @@ func configure(raw []byte) error {
 	return nil
 }
 
+// Registration author identifies the maintainer of this published plugin.
 func pluginRegistration() registration {
-	return registration{SchemaVersion: pluginabi.SchemaVersion, Metadata: pluginapi.Metadata{Name: "凭证并发管理", Version: "0.0.1", Author: "tsunheimat", GitHubRepository: "https://github.com/darvintang/CPAOAuthManager", ConfigFields: []pluginapi.ConfigField{
+	return registration{SchemaVersion: pluginabi.SchemaVersion, Metadata: pluginapi.Metadata{Name: "凭证并发管理", Version: "0.0.1", Author: "darvintang", GitHubRepository: "https://github.com/darvintang/CPAOAuthManager", ConfigFields: []pluginapi.ConfigField{
 		{Name: "max_concurrency", Type: pluginapi.ConfigFieldTypeInteger, Description: "Hard per-account in-flight limit."},
 		{Name: "warm_reserved_slots", Type: pluginapi.ConfigFieldTypeInteger, Description: "Reserved slots for verified warm/strict affinity."},
 		{Name: "wait_timeout", Type: pluginapi.ConfigFieldTypeString, Description: "Bounded admission wait (Go duration, for example 50ms)."},
