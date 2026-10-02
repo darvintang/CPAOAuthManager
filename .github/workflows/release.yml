@@ -37,7 +37,13 @@ jobs:
         shell: bash
         run: |
           version="${GITHUB_REF_NAME#v}"
-          bash scripts/build-release.sh "$version"
+          # Surface build failures in public annotations as logs require sign-in.
+          if ! bash scripts/build-release.sh "$version" > build.log 2>&1; then
+            cat build.log
+            while IFS= read -r line; do echo "::error::$line"; done < <(tail -n 25 build.log)
+            exit 1
+          fi
+          cat build.log
           unzip -o "dist/cpa-oauth-concurrency_${version}_${GOOS}_${GOARCH}.zip" -d dist
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
