@@ -39,15 +39,15 @@ workflow are pinned to full commit SHAs.
 For version `X.Y.Z`, the release contains:
 
 ```text
-cpa-oauth-concurrency_X.Y.Z_linux_amd64.zip
-cpa-oauth-concurrency_X.Y.Z_linux_arm64.zip
-cpa-oauth-concurrency_X.Y.Z_darwin_amd64.zip
-cpa-oauth-concurrency_X.Y.Z_darwin_arm64.zip
-cpa-oauth-concurrency_X.Y.Z_windows_amd64.zip
+cpa-oauth-manager_X.Y.Z_linux_amd64.zip
+cpa-oauth-manager_X.Y.Z_linux_arm64.zip
+cpa-oauth-manager_X.Y.Z_darwin_amd64.zip
+cpa-oauth-manager_X.Y.Z_darwin_arm64.zip
+cpa-oauth-manager_X.Y.Z_windows_amd64.zip
 checksums.txt
 ```
 
 Each ZIP contains exactly one root-level dynamic library. Linux archives contain
-`cpa-oauth-concurrency.so`, Darwin archives contain
-`cpa-oauth-concurrency.dylib`, and Windows archives contain
-`cpa-oauth-concurrency.dll`.
+`cpa-oauth-manager.so`, Darwin archives contain
+`cpa-oauth-manager.dylib`, and Windows archives contain
+`cpa-oauth-manager.dll`.

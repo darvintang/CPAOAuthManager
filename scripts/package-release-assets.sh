@@ -18,7 +18,7 @@ fi
 mkdir -p "$artifact_dir"
 staging_dir="$(cd "$staging_dir" && pwd)"
 artifact_dir="$(cd "$artifact_dir" && pwd)"
-rm -f "$artifact_dir"/cpa-oauth-concurrency_*.zip "$artifact_dir/checksums.txt"
+rm -f "$artifact_dir"/cpa-oauth-manager_*.zip "$artifact_dir/checksums.txt"
 
 package_dir="$(mktemp -d)"
 trap 'rm -rf "$package_dir"' EXIT
@@ -28,9 +28,9 @@ package_target() {
   local goarch="$2"
   local ext="$3"
   # Staged libraries and release archives share the registered plugin ID.
-  local library="cpa-oauth-concurrency.${ext}"
-  local source="${staging_dir}/cpa-oauth-concurrency-${goos}-${goarch}/${library}"
-  local archive="${artifact_dir}/cpa-oauth-concurrency_${version}_${goos}_${goarch}.zip"
+  local library="cpa-oauth-manager.${ext}"
+  local source="${staging_dir}/cpa-oauth-manager-${goos}-${goarch}/${library}"
+  local archive="${artifact_dir}/cpa-oauth-manager_${version}_${goos}_${goarch}.zip"
 
   if [[ ! -s "$source" ]]; then
     echo "missing platform library: $source" >&2
@@ -56,7 +56,7 @@ package_target darwin amd64 dylib
 package_target darwin arm64 dylib
 package_target windows amd64 dll
 
-zip_count="$(find "$artifact_dir" -maxdepth 1 -type f -name 'cpa-oauth-concurrency_*.zip' | wc -l | tr -d ' ')"
+zip_count="$(find "$artifact_dir" -maxdepth 1 -type f -name 'cpa-oauth-manager_*.zip' | wc -l | tr -d ' ')"
 if [[ "$zip_count" != "5" ]]; then
   echo "expected 5 release ZIPs, found $zip_count" >&2
   exit 1
@@ -64,7 +64,7 @@ fi
 
 (
   cd "$artifact_dir"
-  sha256sum cpa-oauth-concurrency_*.zip > checksums.txt
+  sha256sum cpa-oauth-manager_*.zip > checksums.txt
   sha256sum --check checksums.txt
 )
 

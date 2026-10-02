@@ -2,7 +2,7 @@
   "schema_version": 1,
   "plugins": [
     {
-      "id": "cpa-oauth-concurrency",
+      "id": "cpa-oauth-manager",
       "name": "凭证并发管理",
       "description": "按凭证限制并发请求，支持缓存亲和、共享并发控制和实时用量查看。",
       "author": "tsunheimat",

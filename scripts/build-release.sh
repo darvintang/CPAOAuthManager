@@ -37,13 +37,13 @@ esac
 
 # Library and archive names must match the registered plugin ID.
 case "$target_goos" in
-  linux) library="cpa-oauth-concurrency.so" ;;
-  darwin) library="cpa-oauth-concurrency.dylib" ;;
-  windows) library="cpa-oauth-concurrency.dll" ;;
+  linux) library="cpa-oauth-manager.so" ;;
+  darwin) library="cpa-oauth-manager.dylib" ;;
+  windows) library="cpa-oauth-manager.dll" ;;
 esac
 
 artifact_dir="${ARTIFACT_DIR:-dist}"
-archive="cpa-oauth-concurrency_${version}_${target_goos}_${target_goarch}.zip"
+archive="cpa-oauth-manager_${version}_${target_goos}_${target_goarch}.zip"
 
 mkdir -p "$artifact_dir"
 rm -f "$artifact_dir/$archive" "$artifact_dir/$library" "$artifact_dir/checksums.txt"

@@ -27,7 +27,7 @@ authenticated Management Center view of account usage.
 ## Compatibility
 
 - Host: CLIProxyAPI/CPA with the native plugin ABI and request-lifecycle support.
-- Plugin ID: `cpa-oauth-concurrency`.
+- Plugin ID: `cpa-oauth-manager`.
 - Current release: `v0.0.1`.
 - Published binary targets: **Linux amd64/arm64, macOS amd64/arm64, Windows amd64**.
 
@@ -44,7 +44,7 @@ plugins:
   enabled: true
   dir: plugins
   configs:
-    cpa-oauth-concurrency:
+    cpa-oauth-manager:
       enabled: true
       admission-enforcing: true
       priority: 100
@@ -116,7 +116,7 @@ released.
 The usage view reads the authenticated CPA route:
 
 ```text
-/v0/management/plugins/cpa-oauth-concurrency/usage
+/v0/management/plugins/cpa-oauth-manager/usage
 ```
 
 It uses CPA's stock `host.auth.list` callback as the account index and filters an
@@ -148,11 +148,11 @@ Download the assets from the public GitHub Release:
 The release contains all CPA Plugin Store required targets:
 
 ```text
-cpa-oauth-concurrency_0.0.1_linux_amd64.zip
-cpa-oauth-concurrency_0.0.1_linux_arm64.zip
-cpa-oauth-concurrency_0.0.1_darwin_amd64.zip
-cpa-oauth-concurrency_0.0.1_darwin_arm64.zip
-cpa-oauth-concurrency_0.0.1_windows_amd64.zip
+cpa-oauth-manager_0.0.1_linux_amd64.zip
+cpa-oauth-manager_0.0.1_linux_arm64.zip
+cpa-oauth-manager_0.0.1_darwin_amd64.zip
+cpa-oauth-manager_0.0.1_darwin_arm64.zip
+cpa-oauth-manager_0.0.1_windows_amd64.zip
 checksums.txt
 ```
 
@@ -160,18 +160,18 @@ Verify the archive before installation:
 
 ```bash
 sha256sum --check checksums.txt
-unzip -t cpa-oauth-concurrency_0.0.1_linux_amd64.zip
+unzip -t cpa-oauth-manager_0.0.1_linux_amd64.zip
 ```
 
 Each archive contains exactly one root-level dynamic library named for its
-platform: `cpa-oauth-concurrency.so`, `cpa-oauth-concurrency.dylib`, or
-`cpa-oauth-concurrency.dll`.
+platform: `cpa-oauth-manager.so`, `cpa-oauth-manager.dylib`, or
+`cpa-oauth-manager.dll`.
 
 For manual installation, place the versioned library under the CLIProxyAPI
 plugin directory for the target platform:
 
 ```text
-plugins/linux/amd64/cpa-oauth-concurrency-v0.0.1.so
+plugins/linux/amd64/cpa-oauth-manager-v0.0.1.so
 ```
 
 Restart or reload CLIProxyAPI according to its normal plugin lifecycle after

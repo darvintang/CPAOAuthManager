@@ -44,11 +44,11 @@ jobs:
             exit 1
           fi
           cat build.log
-          unzip -o "dist/cpa-oauth-concurrency_${version}_${GOOS}_${GOARCH}.zip" -d dist
+          unzip -o "dist/cpa-oauth-manager_${version}_${GOOS}_${GOARCH}.zip" -d dist
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: cpa-oauth-concurrency-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/cpa-oauth-concurrency.${{ matrix.ext }}
+          name: cpa-oauth-manager-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/cpa-oauth-manager.${{ matrix.ext }}
           if-no-files-found: error
 
   release:
@@ -60,7 +60,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          pattern: cpa-oauth-concurrency-*
+          pattern: cpa-oauth-manager-*
           path: staging
       - name: Package release assets
         run: bash scripts/package-release-assets.sh "${GITHUB_REF_NAME#v}"
@@ -71,9 +71,29 @@ jobs:
           cat > "$RUNNER_TEMP/release-notes.md" <<'EOF'
           凭证并发管理：按凭证限制并发请求，支持缓存亲和、共享并发控制和实时用量查看。
 
-          插件 ID：`cpa-oauth-concurrency`。
+          插件 ID：`cpa-oauth-manager`。
           提供 Linux amd64/arm64、macOS amd64/arm64、Windows amd64 安装包及 SHA-256 校验文件。
           EOF
-          gh release create "$GITHUB_REF_NAME" dist/*.zip dist/checksums.txt \
-            --verify-tag --title "凭证并发管理 $GITHUB_REF_NAME" \
-            --notes-file "$RUNNER_TEMP/release-notes.md"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/*.zip dist/checksums.txt --clobber
+            gh release edit "$GITHUB_REF_NAME" --title "凭证并发管理 $GITHUB_REF_NAME" \
+              --notes-file "$RUNNER_TEMP/release-notes.md"
+            # Remove renamed plugin archives only after every replacement has uploaded.
+            gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' > "$RUNNER_TEMP/release-assets.txt"
+            while IFS= read -r asset; do
+              case "$asset" in
+                cpa-*_${GITHUB_REF_NAME#v}_*.zip)
+                  if [[ ! -f "dist/$asset" ]]; then
+                    gh release delete-asset "$GITHUB_REF_NAME" "$asset" --yes
+                  fi
+                  ;;
+              esac
+            done < "$RUNNER_TEMP/release-assets.txt"
+          else
+            gh release create "$GITHUB_REF_NAME" dist/*.zip dist/checksums.txt \
+              --verify-tag --title "凭证并发管理 $GITHUB_REF_NAME" \
+              --notes-file "$RUNNER_TEMP/release-notes.md"
+          fi
+          # Verify that the published asset set exactly matches the new packages.
+          diff <(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' | sort) \
+            <(cd dist && printf '%s\n' *.zip checksums.txt | sort)

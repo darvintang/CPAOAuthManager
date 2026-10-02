@@ -1,4 +1,4 @@
-module cpa-oauth-concurrency
+module cpa-oauth-manager
 
 go 1.26.0
 

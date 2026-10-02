@@ -153,7 +153,7 @@ func TestManagementUIContainsAuthenticatedRefreshAndFailureStates(t *testing.T) 
 	if strings.Contains(body, `"in_flight":`) || strings.Contains(body, `"accounts_in_use":`) {
 		t.Fatal("unauthenticated resource embeds live allocation values")
 	}
-	for _, want := range []string{"/v0/management/plugins/cpa-oauth-concurrency/usage", "Settings", "type=\"password\"", "localStorage", "storageKey", "X-Management-Key", "credentials:'same-origin'", "method:'GET'", "Loading live usage", "Management key required.", "Unable to load live usage", "Management authentication required.", "stale", "aria-live", "All available accounts", "summary-total", "summary-warm", "Total (in-flight / limit)", "Warm reserved (in-flight / reserved)", "a.in_flight+' / '+a.limit", "a.warm_flight+' / '+a.reserved", "Save key", "Clear saved key", "removeItem", "setItem"} {
+	for _, want := range []string{"/v0/management/plugins/cpa-oauth-manager/usage", "Settings", "type=\"password\"", "localStorage", "storageKey", "X-Management-Key", "credentials:'same-origin'", "method:'GET'", "Loading live usage", "Management key required.", "Unable to load live usage", "Management authentication required.", "stale", "aria-live", "All available accounts", "summary-total", "summary-warm", "Total (in-flight / limit)", "Warm reserved (in-flight / reserved)", "a.in_flight+' / '+a.limit", "a.warm_flight+' / '+a.reserved", "Save key", "Clear saved key", "removeItem", "setItem"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("UI missing %q", want)
 		}

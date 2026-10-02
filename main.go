@@ -46,8 +46,8 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Keep the routing ID aligned with registry metadata and release library names; the display name is localized separately.
-const pluginID = "cpa-oauth-concurrency"
+// Keep cpa-oauth-manager consistent across routing, registry metadata and release filenames; localize the display name separately.
+const pluginID = "cpa-oauth-manager"
 
 // authorityCallTimeout bounds release/renew/snapshot calls that are not
 // already covered by the request admission wait timeout.  A lost authority
@@ -130,7 +130,7 @@ type warmUsageMetric struct {
 }
 
 const (
-	managementUsagePath = "/plugins/cpa-oauth-concurrency/usage"
+	managementUsagePath = "/plugins/cpa-oauth-manager/usage"
 	managementUIPath    = "/ui"
 )
 
@@ -477,7 +477,7 @@ const managementHTMLAuthenticated = `<!doctype html>
 <section class="settings" aria-labelledby="settings-title"><h2 id="settings-title">Settings</h2><form id="settings-form"><label for="management-key">CPA Management key<input id="management-key" name="management-key" type="password" autocomplete="off" spellcheck="false"></label><button id="save-key" type="submit">Save key</button><button id="clear-key" type="button">Clear saved key</button></form><p id="key-status" role="status" aria-live="polite"></p></section>
 <p><button id="refresh" type="button">Refresh now</button> <span id="updated" aria-live="polite"></span></p><div id="state" role="status" aria-live="polite">Loading live usage...</div><section class="summary" aria-labelledby="summary-title"><h2 id="summary-title">All available accounts</h2><dl><div><dt>Total (in-flight / limit)</dt><dd id="summary-total">--</dd></div><div><dt>Warm reserved (in-flight / reserved)</dt><dd id="summary-warm">--</dd></div></dl></section><table><caption>Available CPA accounts</caption><thead><tr><th scope="col">Account</th><th scope="col">Total (in-flight / limit)</th><th scope="col">Warm reserved (in-flight / reserved)</th></tr></thead><tbody id="accounts"></tbody></table>
 <script>(function(){
-const api='/v0/management/plugins/cpa-oauth-concurrency/usage',storageKey='cpa-oauth-concurrency.management-key';
+const api='/v0/management/plugins/cpa-oauth-manager/usage',storageKey='cpa-oauth-manager.management-key';
 const state=document.getElementById('state'),accounts=document.getElementById('accounts'),updated=document.getElementById('updated'),summaryTotal=document.getElementById('summary-total'),summaryWarm=document.getElementById('summary-warm'),keyInput=document.getElementById('management-key'),keyStatus=document.getElementById('key-status');
 const esc=v=>String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));
 function readKey(){try{return localStorage.getItem(storageKey)||''}catch(_){return ''}}
