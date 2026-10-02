@@ -60,7 +60,7 @@ func resetTestState() {
 
 func TestPluginRegistrationIncludesRequiredRepositoryMetadata(t *testing.T) {
 	reg := pluginRegistration()
-	if reg.Metadata.GitHubRepository != "https://github.com/darvintang/CPA-OAuth-Manager" {
+	if reg.Metadata.GitHubRepository != "https://github.com/darvintang/CPAOAuthManager" {
 		t.Fatalf("GitHubRepository = %q", reg.Metadata.GitHubRepository)
 	}
 	if reg.Metadata.Name != "凭证并发管理" || reg.Metadata.Version != "0.0.1" || reg.Metadata.Author != "tsunheimat" || !reg.Capabilities.Scheduler || !reg.Capabilities.RequestInterceptorEnforcesAdmission {
