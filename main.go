@@ -48,6 +48,7 @@ import (
 
 // Keep cpa-oauth-manager consistent across routing, registry metadata and release filenames; localize the display name separately.
 const pluginID = "cpa-oauth-manager"
+const requestReservationHeader = "X-Cpa-Concurrency-Request"
 
 // authorityCallTimeout bounds release/renew/snapshot calls that are not
 // already covered by the request admission wait timeout.  A lost authority
@@ -81,6 +82,7 @@ type registration struct {
 	Capabilities  registrationCapabilities `json:"capabilities"`
 }
 type registrationCapabilities struct {
+	SchedulerAcrossPriorities           bool `json:"scheduler_across_priorities"`
 	Scheduler                           bool `json:"scheduler"`
 	RequestInterceptor                  bool `json:"request_interceptor"`
 	RequestInterceptorEnforcesAdmission bool `json:"request_interceptor_enforces_admission"`
@@ -346,7 +348,7 @@ func accountLabel(key string, metadata map[string]pluginapi.HostAuthFileEntry) s
 func managementRegistrationResponse() managementRegistrationPayload {
 	return managementRegistrationPayload{
 		Routes:    []pluginapi.ManagementRoute{{Method: http.MethodGet, Path: managementUsagePath}},
-		Resources: []pluginapi.ResourceRoute{{Path: managementUIPath, Menu: "凭证并发管理", Description: "按凭证限制并发请求，支持缓存亲和、共享并发控制和实时用量查看。"}},
+		Resources: []pluginapi.ResourceRoute{{Path: managementUIPath, Menu: "凭证管理", Description: "按凭证限制并发请求，支持缓存亲和、共享并发控制和实时用量查看。"}},
 	}
 }
 
@@ -398,7 +400,7 @@ func readConcurrencySnapshot(ctx context.Context) concurrencySnapshot {
 		s.Stale = true
 		s.Error = "account list unavailable"
 	} else {
-		accounts, usage, usageErr := availableAccountSnapshots(ctx, authority, metadata, cfg.MaxConcurrency, cfg.WarmReservedSlots)
+		accounts, usage, usageErr := availableAccountSnapshots(ctx, authority, metadata, cfg)
 		if usageErr != nil {
 			s.Stale = true
 			s.Error = "concurrency authority unavailable"
@@ -433,7 +435,7 @@ func summaryFromAccounts(accounts []AccountUsage) concurrencySummary {
 
 // availableAccountSnapshots reads usage only for accounts successfully returned
 // by the host listing. A failed authority read is not converted to zero usage.
-func availableAccountSnapshots(ctx context.Context, authority Authority, metadata map[string]pluginapi.HostAuthFileEntry, limit, reserved int) ([]AccountUsage, Usage, error) {
+func availableAccountSnapshots(ctx context.Context, authority Authority, metadata map[string]pluginapi.HostAuthFileEntry, cfg pluginConfig) ([]AccountUsage, Usage, error) {
 	ctx, cancel := ensureAuthorityContext(ctx)
 	defer cancel()
 	keys := make([]string, 0, len(metadata))
@@ -443,13 +445,14 @@ func availableAccountSnapshots(ctx context.Context, authority Authority, metadat
 	sort.Strings(keys)
 	accounts := make([]AccountUsage, 0, len(keys))
 	var total Usage
-	total.Limit, total.Reserved = limit, reserved
+	total.Limit, total.Reserved = cfg.MaxConcurrency, cfg.WarmReservedSlots
 	for _, key := range keys {
+		limit, reserved := cfg.limitsFor(key)
 		u, err := authority.Snapshot(ctx, key, limit, reserved)
 		if err != nil {
 			return nil, Usage{}, err
 		}
-		accounts = append(accounts, AccountUsage{Key: key, Label: accountLabel(key, metadata), Limit: limit, Reserved: reserved, InFlight: u.InFlight, WarmFlight: u.WarmFlight})
+		accounts = append(accounts, AccountUsage{Key: key, ConfigID: key, Label: accountLabel(key, metadata), Limit: limit, Reserved: reserved, InFlight: u.InFlight, WarmFlight: u.WarmFlight})
 		total.InFlight += u.InFlight
 		total.WarmFlight += u.WarmFlight
 	}
@@ -466,27 +469,412 @@ func countActiveAccounts(accounts []AccountUsage) int {
 	return count
 }
 
-// managementHTMLAuthenticated is a static resource. The browser stores the
-// CPA Management key for this origin and sends it only as an authentication
-// header on the live usage request. The key is never put in a URL or rendered
-// into metrics/errors.
+// managementHTMLAuthenticated reuses the same-origin Management Center login.
+// Show manual credentials only when automatic authentication is unavailable or rejected.
+// Host credentials stay in host storage and are sent only in authentication headers;
+// the password input and manual fallback storage never receive the host key.
 const managementHTMLAuthenticated = `<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>凭证并发管理</title>
-<style>body{font:16px system-ui,sans-serif;max-width:760px;margin:2rem auto;padding:0 1rem;color:#17202a}h1{font-size:1.5rem}.settings{border:1px solid #b8c2cc;border-radius:6px;padding:1rem;margin:1rem 0}.settings form{display:flex;gap:.5rem;flex-wrap:wrap;align-items:end}.settings label{display:flex;flex-direction:column;gap:.25rem;flex:1 1 280px}.settings input{font:inherit;padding:.45rem}.settings p{margin:.75rem 0 0;color:#4b5563;font-size:.9rem}#state{margin:1rem 0;padding:.75rem;border-left:4px solid #4b5563;background:#f3f4f6}.summary{border:1px solid #b8c2cc;border-radius:6px;padding:.75rem 1rem;margin:1rem 0}.summary h2{font-size:1rem;margin:0 0 .5rem}.summary dl{display:flex;gap:2rem;margin:0;flex-wrap:wrap}.summary dt{font-size:.85rem;color:#4b5563}.summary dd{margin:.15rem 0 0;font-variant-numeric:tabular-nums}button{padding:.5rem .75rem;font:inherit}table{width:100%;border-collapse:collapse;margin-top:1.25rem}th,td{text-align:left;border-bottom:1px solid #d1d5db;padding:.5rem;font-variant-numeric:tabular-nums}th:nth-child(n+2),td:nth-child(n+2){text-align:right}</style></head>
-<body><h1>凭证并发管理</h1>
-<section class="settings" aria-labelledby="settings-title"><h2 id="settings-title">Settings</h2><form id="settings-form"><label for="management-key">CPA Management key<input id="management-key" name="management-key" type="password" autocomplete="off" spellcheck="false"></label><button id="save-key" type="submit">Save key</button><button id="clear-key" type="button">Clear saved key</button></form><p id="key-status" role="status" aria-live="polite"></p></section>
-<p><button id="refresh" type="button">Refresh now</button> <span id="updated" aria-live="polite"></span></p><div id="state" role="status" aria-live="polite">Loading live usage...</div><section class="summary" aria-labelledby="summary-title"><h2 id="summary-title">All available accounts</h2><dl><div><dt>Total (in-flight / limit)</dt><dd id="summary-total">--</dd></div><div><dt>Warm reserved (in-flight / reserved)</dt><dd id="summary-warm">--</dd></div></dl></section><table><caption>Available CPA accounts</caption><thead><tr><th scope="col">Account</th><th scope="col">Total (in-flight / limit)</th><th scope="col">Warm reserved (in-flight / reserved)</th></tr></thead><tbody id="accounts"></tbody></table>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Credential Manager</title>
+<style>
+:root{color-scheme:light;--bg:#fff;--panel:#fff;--alt:#f5f5f5;--text:#242424;--muted:#737373;--line:#e5e5e5;--brand:#424242;--success:#10b981}
+:root[data-theme="white"]{--bg:#fff;--panel:#fff;--alt:#f5f5f5;--text:#242424;--muted:#737373;--line:#e5e5e5;--brand:#424242}
+:root[data-theme="dark"]{color-scheme:dark;--bg:#151412;--panel:#1d1b18;--alt:#262320;--text:#f6f4f1;--muted:#c9c3bb;--line:#3a3530;--brand:#8b8680}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;background:var(--bg);color:var(--text);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;-webkit-font-smoothing:antialiased}
+.shell{width:min(1280px,calc(100% - 48px));margin:0 auto;padding:32px 0 48px}header{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:20px}h1{margin:0 0 6px;font-size:clamp(24px,2.4vw,28px);line-height:1.25;letter-spacing:-.025em}h2{margin:0;font-size:15px;font-weight:650}p{margin:0;color:var(--muted)}.subtitle{font-size:13px}.auth{font-size:12px;color:var(--muted);margin-top:10px}.toolbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center}.cards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-bottom:16px}.card,.panel,.settings{background:var(--panel);border:1px solid var(--line);border-radius:12px;box-shadow:0 1px 2px #0000000a}.card{padding:18px}.card dt{font-size:12px;color:var(--muted)}.card dd{margin:10px 0 0;font-size:clamp(22px,2.2vw,28px);font-weight:700;line-height:1.2;font-variant-numeric:tabular-nums}.cards{padding:0}dl{margin:0}.panel{overflow:hidden}.panel-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px;border-bottom:1px solid var(--line)}.panel-head span{font-size:12px;color:var(--muted)}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse}th,td{padding:14px 16px;border-bottom:1px solid var(--line);text-align:right;font-variant-numeric:tabular-nums}th{font-size:12px;color:var(--muted);background:var(--alt);font-weight:600}th:first-child,td:first-child{text-align:left}td:first-child{overflow-wrap:anywhere;min-width:160px;font-weight:600}tbody tr:last-child td{border:0}tbody tr:hover{background:var(--alt)}.empty td{text-align:center;font-weight:400;color:var(--muted);padding:40px 16px}.status{font-size:12px;color:var(--muted);border-left:3px solid var(--success);padding:4px 12px;margin:0 0 18px}.settings{margin-top:16px;padding:14px 16px}.settings summary{cursor:pointer;font-weight:600}.settings form{display:flex;flex-wrap:wrap;align-items:end;gap:8px;margin-top:16px}.settings label{display:flex;flex:1 1 240px;flex-direction:column;gap:6px;font-size:12px;color:var(--muted)}button,input,select{border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--text);min-height:36px;padding:7px 12px;font:inherit}button{cursor:pointer;font-weight:600}button:hover{background:var(--alt)}button.primary{background:var(--brand);border-color:var(--brand);color:#fff;white-space:nowrap}button:disabled{opacity:.55;cursor:wait}button:focus-visible,input:focus-visible,summary:focus-visible{outline:2px solid var(--success);outline-offset:3px}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.config-status:not(:empty){padding:12px 16px;border-bottom:1px solid var(--line)}#accounts input{width:92px}#accounts td small{display:block;color:var(--muted);font-size:11px;font-weight:400}#accounts tr.dirty{background:var(--alt)}.limit-form{display:flex;align-items:center;flex-wrap:wrap;gap:12px}.limit-form label{display:flex;flex-direction:column;gap:3px;flex:1 1 240px;font-weight:600}.limit-form small{font-weight:400;color:var(--muted)}#concurrency-limit{width:100px}#credential-select{max-width:100%;flex:1 1 200px;min-width:0}#config-status:not(:empty){margin-top:10px;font-size:12px}
+.column-label{display:inline-flex;align-items:center;gap:5px;white-space:nowrap}.info-button{display:inline-flex;align-items:center;justify-content:center;min-height:26px;width:26px;padding:3px;border:0;background:transparent;color:var(--muted);border-radius:50%}.info-button:hover{color:var(--text);background:var(--line)}.help-popover{position:fixed;inset:auto;margin:0;width:min(330px,calc(100vw - 32px));padding:16px;border:1px solid var(--line);border-radius:12px;background:var(--panel);color:var(--text);box-shadow:0 8px 28px #0002}.help-popover p{margin-top:8px;font-size:13px;line-height:1.7}table{min-width:880px}th,td:not(:first-child){white-space:nowrap}.card{min-width:0}
+@media(max-width:640px){.shell{width:calc(100% - 28px);padding:20px 0 32px}header{flex-direction:column}.cards{grid-template-columns:1fr}.card{padding:14px}.panel-head{align-items:flex-start;flex-direction:column}th,td{padding:12px}.settings button{flex:1}h1{font-size:24px}}
+</style></head><body><main class="shell">
+<header><div><h1 data-i18n="Credential Manager">Credential Manager</h1><p class="subtitle" data-i18n="Per-credential concurrency and cache reservations">Per-credential concurrency and cache reservations</p><p id="key-status" class="auth" role="status" aria-live="polite"></p></div><div class="toolbar"><button id="refresh" class="primary" type="button" data-i18n="Refresh now">Refresh now</button></div></header>
+<div id="state" class="status" role="status" aria-live="polite" data-i18n="Loading live usage...">Loading live usage...</div>
+<dl class="cards"><div class="card"><dt data-i18n="All credentials">All credentials</dt><dd id="summary-count">--</dd></div><div class="card"><dt data-i18n="Total (in-flight / limit)">Total (in-flight / limit)</dt><dd id="summary-total">--</dd></div><div class="card"><dt data-i18n="Warm reserved (in-flight / reserved)">Warm reserved (in-flight / reserved)</dt><dd id="summary-warm">--</dd></div></dl>
+<section class="panel"><div class="panel-head"><h2 data-i18n="All credentials">All credentials</h2><div class="toolbar"><span id="updated" aria-live="polite"></span><button id="save-all" class="primary" type="button" disabled data-i18n="Save all changes">Save all changes</button></div></div><p id="config-status" class="config-status" role="status" aria-live="polite"></p><div class="table-wrap"><table><caption class="sr-only" data-i18n="All credentials">All credentials</caption><thead><tr><th scope="col" data-i18n="Account">Account</th><th scope="col" data-i18n="Status">Status</th><th scope="col"><span class="column-label"><span data-i18n="Priority">Priority</span><button type="button" class="info-button" popovertarget="priority-help" data-i18n-aria="Priority details" aria-label="Priority details"><svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><circle cx="10" cy="10" r="7.25" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M10 9v5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="10" cy="6" r="1" fill="currentColor"/></svg></button></span></th><th scope="col"><span class="column-label"><span data-i18n="Scheduling weight">Scheduling weight</span><button type="button" class="info-button" popovertarget="weight-help" data-i18n-aria="Scheduling weight details" aria-label="Scheduling weight details"><svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><circle cx="10" cy="10" r="7.25" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M10 9v5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="10" cy="6" r="1" fill="currentColor"/></svg></button></span></th><th scope="col" data-i18n="Concurrency limit">Concurrency limit</th><th scope="col" data-i18n="Active requests">Active requests</th></tr></thead><tbody id="accounts"></tbody></table></div></section>
+<details id="settings" class="settings" hidden><summary id="settings-title" data-i18n="Settings">Settings</summary><form id="settings-form"><label for="management-key"><span data-i18n="CPA Management key">CPA Management key</span><input id="management-key" name="management-key" type="password" autocomplete="off" spellcheck="false"></label><button id="save-key" type="submit" data-i18n="Save key">Save key</button><button id="clear-key" type="button" data-i18n="Clear saved key">Clear saved key</button></form></details>
+<div id="priority-help" class="help-popover" popover><h2 data-i18n="Priority">Priority</h2><p data-i18n="Priority explanation"></p></div><div id="weight-help" class="help-popover" popover><h2 data-i18n="Scheduling weight">Scheduling weight</h2><p data-i18n="Weight explanation"></p></div>
+</main>
 <script>(function(){
 const api='/v0/management/plugins/cpa-oauth-manager/usage',storageKey='cpa-oauth-manager.management-key';
 const state=document.getElementById('state'),accounts=document.getElementById('accounts'),updated=document.getElementById('updated'),summaryTotal=document.getElementById('summary-total'),summaryWarm=document.getElementById('summary-warm'),keyInput=document.getElementById('management-key'),keyStatus=document.getElementById('key-status');
+// Follow CPAMC persisted language; preserve English API identifiers and credential values.
+const messages={
+  "zh-CN": {
+    "Credential Manager": "凭证管理",
+    "Settings": "设置",
+    "CPA Management key": "CPA 管理密码",
+    "Save key": "保存密码",
+    "Clear saved key": "清除已存密码",
+    "Refresh now": "立即刷新",
+    "All available accounts": "所有可用凭证",
+    "Total (in-flight / limit)": "总并发（使用中 / 上限）",
+    "Warm reserved (in-flight / reserved)": "缓存预留（使用中 / 预留）",
+    "Available CPA accounts": "可用 CPA 凭证",
+    "Account": "凭证",
+    "Loading live usage...": "正在加载实时用量…",
+    "Management key required. Save a key in Settings to load live usage.": "未读取到管理密码。请在管理中心登录时勾选“记住密码”，或在设置中填写。",
+    "Management authentication required.": "管理认证失败，请重新登录管理中心或更新密码。",
+    "Unable to load live usage.": "无法加载实时用量。",
+    "Using Management Center authentication.": "已自动使用管理中心登录凭据。",
+    "Enter a Management key.": "请输入管理密码。",
+    "Unable to save the Management key in this browser.": "无法在此浏览器中保存管理密码。",
+    "Management key saved for this browser.": "已在此浏览器中保存管理密码。",
+    "Unable to clear the saved Management key.": "无法清除已保存的管理密码。",
+    "Saved Management key cleared.": "已清除手动保存的管理密码。",
+    "Authority: ": "并发控制状态：",
+    "Last refresh ": "上次刷新：",
+    "available": "可用",
+    "unavailable": "不可用",
+    "connected": "已连接",
+    "unknown": "未知",
+    "stale": "数据已过期",
+    "concurrency authority unavailable": "并发控制服务不可用",
+    "account list unavailable": "无法获取凭证列表",
+    "Per-credential concurrency and cache reservations": "管理所有凭证的优先级、调度权重与并发上限",
+    "No available credentials": "暂无可用凭证",
+    "Concurrency limit per credential": "每个凭证的并发上限",
+    "Choose a credential and set its own limit": "选择凭证，单独设置并发上限",
+    "Save": "保存",
+    "Enter an integer greater than zero.": "请输入大于 0 的整数。",
+    "Saving...": "正在保存…",
+    "Concurrency limit saved.": "并发上限已保存。",
+    "Unable to load concurrency settings.": "无法加载并发设置。",
+    "Unable to save concurrency settings.": "无法保存并发设置，请重试。",
+    "Save all changes": "保存全部修改",
+    "All credentials": "所有凭证",
+    "Priority": "优先级",
+    "Scheduling weight": "调度权重",
+    "Concurrency limit": "并发上限",
+    "Active requests": "当前并发",
+    "Status": "状态",
+    "Enabled": "已启用",
+    "Disabled": "已停用",
+    "Unavailable": "暂不可用",
+    "Unsaved changes": "有未保存的修改",
+    "All changes saved.": "全部修改已保存。",
+    "Some changes could not be saved. Pending edits are retained; retry Save.": "部分修改保存失败，未成功的修改已保留，请重试保存。",
+    "Enter valid integers: priority, weight ≤1000000, concurrency 1–1000000.": "请输入有效整数：优先级、权重 ≤1000000、并发上限 1–1000000。",
+    "Credentials changed elsewhere. Refresh before saving.": "凭证已在其他页面修改，请刷新后再保存。",
+    "Priority explanation": "仅支持整数，数值越大优先级越高。本页面会阻止非法值保存。高优先级凭证达到并发上限后，插件会尝试较低优先级的可用凭证。",
+    "Weight explanation": "默认值为 1；小于或等于 0 时不参与加权调度；最大值为 1,000,000。CLIProxyAPI 原生调度需开启“加权轮询”才按权重分配。本插件接管选凭证时，会在同一优先级且有空余并发的候选中按权重选择；会话亲和可能优先复用已有凭证。",
+    "Priority details": "优先级说明",
+    "Scheduling weight details": "调度权重说明"
+  },
+  "zh-TW": {
+    "Credential Manager": "憑證管理",
+    "Settings": "設定",
+    "CPA Management key": "CPA 管理密碼",
+    "Save key": "儲存密碼",
+    "Clear saved key": "清除已存密碼",
+    "Refresh now": "立即重新整理",
+    "All available accounts": "所有可用憑證",
+    "Total (in-flight / limit)": "總並行（使用中 / 上限）",
+    "Warm reserved (in-flight / reserved)": "快取預留（使用中 / 預留）",
+    "Available CPA accounts": "可用 CPA 憑證",
+    "Account": "憑證",
+    "Loading live usage...": "正在載入即時用量…",
+    "Management key required. Save a key in Settings to load live usage.": "未讀取到管理密碼。請在管理中心登入時勾選「記住密碼」，或在設定中填寫。",
+    "Management authentication required.": "管理驗證失敗，請重新登入管理中心或更新密碼。",
+    "Unable to load live usage.": "無法載入即時用量。",
+    "Using Management Center authentication.": "已自動使用管理中心登入憑據。",
+    "Enter a Management key.": "請輸入管理密碼。",
+    "Unable to save the Management key in this browser.": "無法在此瀏覽器中儲存管理密碼。",
+    "Management key saved for this browser.": "已在此瀏覽器中儲存管理密碼。",
+    "Unable to clear the saved Management key.": "無法清除已儲存的管理密碼。",
+    "Saved Management key cleared.": "已清除手動儲存的管理密碼。",
+    "Authority: ": "並行控制狀態：",
+    "Last refresh ": "上次重新整理：",
+    "available": "可用",
+    "unavailable": "無法使用",
+    "connected": "已連線",
+    "unknown": "未知",
+    "stale": "資料已過期",
+    "concurrency authority unavailable": "並行控制服務無法使用",
+    "account list unavailable": "無法取得憑證清單",
+    "Per-credential concurrency and cache reservations": "管理所有憑證的優先順序、排程權重與並行上限",
+    "No available credentials": "暫無可用憑證",
+    "Concurrency limit per credential": "每個憑證的並行上限",
+    "Choose a credential and set its own limit": "選擇憑證，單獨設定並行上限",
+    "Save": "儲存",
+    "Enter an integer greater than zero.": "請輸入大於 0 的整數。",
+    "Saving...": "正在儲存…",
+    "Concurrency limit saved.": "並行上限已儲存。",
+    "Unable to load concurrency settings.": "無法載入並行設定。",
+    "Unable to save concurrency settings.": "無法儲存並行設定，請重試。",
+    "Save all changes": "儲存全部修改",
+    "All credentials": "所有憑證",
+    "Priority": "優先順序",
+    "Scheduling weight": "排程權重",
+    "Concurrency limit": "並行上限",
+    "Active requests": "目前並行數",
+    "Status": "狀態",
+    "Enabled": "已啟用",
+    "Disabled": "已停用",
+    "Unavailable": "暫時無法使用",
+    "Unsaved changes": "有未儲存的修改",
+    "All changes saved.": "全部修改已儲存。",
+    "Some changes could not be saved. Pending edits are retained; retry Save.": "部分修改儲存失敗，未成功的修改已保留，請重試儲存。",
+    "Enter valid integers: priority, weight ≤1000000, concurrency 1–1000000.": "請輸入有效整數：優先順序、權重 ≤1000000、並行上限 1–1000000。",
+    "Credentials changed elsewhere. Refresh before saving.": "憑證已在其他頁面修改，請重新整理後再儲存。",
+    "Priority explanation": "僅支援整數，數值越大優先順序越高。本頁面會阻止無效值儲存。高優先順序憑證達到並行上限後，外掛會嘗試較低優先順序的可用憑證。",
+    "Weight explanation": "預設值為 1；小於或等於 0 時不參與加權排程；最大值為 1,000,000。CLIProxyAPI 原生排程需啟用「加權輪詢」。此外掛接管選擇時，會在相同優先順序且有剩餘容量的候選中按權重選擇；工作階段親和可能優先重用既有憑證。",
+    "Priority details": "優先順序說明",
+    "Scheduling weight details": "排程權重說明"
+  },
+  "ru": {
+    "Credential Manager": "Управление учётными данными",
+    "Settings": "Настройки",
+    "CPA Management key": "Ключ управления CPA",
+    "Save key": "Сохранить ключ",
+    "Clear saved key": "Удалить сохранённый ключ",
+    "Refresh now": "Обновить",
+    "All available accounts": "Все доступные учётные данные",
+    "Total (in-flight / limit)": "Всего (активные / лимит)",
+    "Warm reserved (in-flight / reserved)": "Резерв кэша (активные / резерв)",
+    "Available CPA accounts": "Доступные учётные данные CPA",
+    "Account": "Учётные данные",
+    "Loading live usage...": "Загрузка текущего использования…",
+    "Management key required. Save a key in Settings to load live usage.": "Ключ не найден. Войдите в центр управления с опцией сохранения пароля или укажите ключ в настройках.",
+    "Management authentication required.": "Ошибка авторизации. Войдите заново или обновите ключ.",
+    "Unable to load live usage.": "Не удалось загрузить данные.",
+    "Using Management Center authentication.": "Используются учётные данные центра управления.",
+    "Enter a Management key.": "Введите ключ управления.",
+    "Unable to save the Management key in this browser.": "Не удалось сохранить ключ в браузере.",
+    "Management key saved for this browser.": "Ключ сохранён в браузере.",
+    "Unable to clear the saved Management key.": "Не удалось удалить сохранённый ключ.",
+    "Saved Management key cleared.": "Вручную сохранённый ключ удалён.",
+    "Authority: ": "Состояние: ",
+    "Last refresh ": "Обновлено: ",
+    "available": "доступно",
+    "unavailable": "недоступно",
+    "connected": "подключено",
+    "unknown": "неизвестно",
+    "stale": "данные устарели",
+    "concurrency authority unavailable": "Сервис ограничения параллельных запросов недоступен",
+    "account list unavailable": "Список учётных данных недоступен",
+    "Per-credential concurrency and cache reservations": "Приоритет, вес и лимит для каждой записи",
+    "No available credentials": "Нет доступных учётных данных",
+    "Concurrency limit per credential": "Лимит запросов на учётные данные",
+    "Choose a credential and set its own limit": "Выберите запись и задайте её лимит",
+    "Save": "Сохранить",
+    "Enter an integer greater than zero.": "Введите целое число больше нуля.",
+    "Saving...": "Сохранение…",
+    "Concurrency limit saved.": "Лимит сохранён.",
+    "Unable to load concurrency settings.": "Не удалось загрузить настройки.",
+    "Unable to save concurrency settings.": "Не удалось сохранить настройки. Повторите попытку.",
+    "Save all changes": "Сохранить все изменения",
+    "All credentials": "Все учётные данные",
+    "Priority": "Приоритет",
+    "Scheduling weight": "Вес планирования",
+    "Concurrency limit": "Лимит запросов",
+    "Active requests": "Активные запросы",
+    "Status": "Состояние",
+    "Enabled": "Включено",
+    "Disabled": "Отключено",
+    "Unavailable": "Недоступно",
+    "Unsaved changes": "Есть несохранённые изменения",
+    "All changes saved.": "Все изменения сохранены.",
+    "Some changes could not be saved. Pending edits are retained; retry Save.": "Часть изменений не сохранена. Несохранённые правки сохранены в форме; повторите попытку.",
+    "Enter valid integers: priority, weight ≤1000000, concurrency 1–1000000.": "Введите целые числа: приоритет, вес ≤1000000, лимит 1–1000000.",
+    "Credentials changed elsewhere. Refresh before saving.": "Учётные данные изменены в другом окне. Обновите страницу перед сохранением.",
+    "Priority explanation": "Только целые числа: большее значение означает более высокий приоритет. Неверные значения не сохраняются. При исчерпании лимита верхнего уровня плагин выбирает доступные записи с меньшим приоритетом.",
+    "Weight explanation": "По умолчанию 1; значения не выше 0 исключают взвешенный выбор; максимум 1 000 000. Штатному CLIProxyAPI нужен режим взвешенного round-robin. При выборе через плагин веса применяются к доступным записям одного приоритета; привязка сессии может предпочесть текущую запись.",
+    "Priority details": "О приоритете",
+    "Scheduling weight details": "О весе планирования"
+  },
+  "en": {
+    "Priority explanation": "Integers only; larger values have higher priority. This page blocks invalid values from being saved. When higher-priority credentials reach their concurrency limits, the plugin tries available lower-priority credentials.",
+    "Weight explanation": "Default: 1. Values at or below zero are excluded from weighted selection. Maximum: 1,000,000. Native CLIProxyAPI scheduling requires weighted round-robin to use weights. When this plugin controls selection, it uses weights among same-priority candidates with capacity; session affinity may reuse an existing credential first."
+  }
+};
+let language='en',appliedLanguage='';
+function t(value){return messages[language]?.[value]||value}
+function applyTheme(){
+  const saved=readHostValue('cli-proxy-theme');
+  const theme=saved?.state?.theme||saved?.theme||'auto';
+  const resolved=theme==='auto'?(window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'):theme;
+  if(document.documentElement.dataset.theme!==resolved){document.documentElement.dataset.theme=resolved}
+}
+function applyLanguage(){
+  let selected;
+  try{const saved=readHostValue('cli-proxy-language');selected=saved?.state?.language||saved?.language||saved}catch(_){}
+  selected=selected||navigator.language||'en';
+  language=/^zh-(TW|HK|MO|Hant)/i.test(selected)?'zh-TW':/^zh/i.test(selected)?'zh-CN':/^ru/i.test(selected)?'ru':'en';
+  if(appliedLanguage===language){return}
+  appliedLanguage=language;
+  document.documentElement.lang=language;
+  document.title=t('Credential Manager');
+  document.querySelectorAll('[data-i18n]').forEach(el=>{el.textContent=t(el.dataset.i18n)});
+  document.querySelectorAll('[data-i18n-aria]').forEach(el=>{el.setAttribute('aria-label',t(el.dataset.i18nAria))});
+}
+function setText(element,value){value=String(value);if(element.textContent!==value){element.textContent=value}}
+function setMessage(element,message){element.dataset.i18n=message;setText(element,t(message))}
 const esc=v=>String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));
-function readKey(){try{return localStorage.getItem(storageKey)||''}catch(_){return ''}}
+function readHostValue(name){
+  try{
+    let value=localStorage.getItem(name);
+    if(!value){return null}
+    // Match CPAMC secure-storage v1, including its origin and user-agent binding.
+    if(value.startsWith('enc::v1::')){
+      const mask=new TextEncoder().encode('cli-proxy-api-webui::secure-storage|'+location.host+'|'+navigator.userAgent);
+      const bytes=Uint8Array.from(atob(value.slice(9)),c=>c.charCodeAt(0));
+      for(let i=0;i<bytes.length;i++){bytes[i]^=mask[i%mask.length]}
+      value=new TextDecoder('utf-8',{fatal:true}).decode(bytes);
+    }
+    try{return JSON.parse(value)}catch(_){return value}
+  }catch(_){return null}
+}
+function readHostKey(){
+  try{
+    const auth=readHostValue('cli-proxy-auth')?.state;
+    // Never send a saved credential for a different backend to this plugin server.
+    const backend=auth?.apiBase||readHostValue('apiBase')||readHostValue('apiUrl');
+    if(backend&&new URL(backend).origin!==location.origin){return ''}
+    if(typeof auth?.managementKey==='string'&&auth.managementKey.trim()){return auth.managementKey.trim()}
+    const legacy=readHostValue('managementKey');
+    return typeof legacy==='string'?legacy.trim():'';
+  }catch(_){return ''}
+}
+function readManualKey(){try{return localStorage.getItem(storageKey)||''}catch(_){return ''}}
+let rejectedHostKey='';
+function readKey(){const host=readHostKey();return(host!==rejectedHostKey?host:'')||readManualKey()}
 function writeKey(value){try{localStorage.setItem(storageKey,value);return true}catch(_){return false}}
 function removeKey(){try{localStorage.removeItem(storageKey);return true}catch(_){return false}}
-function clearUsage(){accounts.innerHTML='';summaryTotal.textContent='--';summaryWarm.textContent='--';updated.textContent=''}
-function render(d){const summary=d.summary||{};const total=summary.total||{};const warm=summary.warm_reserved||{};summaryTotal.textContent=(total.in_flight??0)+' / '+(total.limit??0);summaryWarm.textContent=(warm.in_flight??0)+' / '+(warm.reserved??0);accounts.innerHTML=(d.accounts||[]).map(a=>'<tr><td>'+esc(a.label||'Account')+'</td><td>'+a.in_flight+' / '+a.limit+'</td><td>'+a.warm_flight+' / '+a.reserved+'</td></tr>').join('');let msg='Authority: '+(d.authority_state||'unknown');if(d.stale)msg+='; stale';if(d.error)msg+='; '+d.error;state.textContent=msg;updated.textContent=d.last_refresh?'Last refresh '+new Date(d.last_refresh).toLocaleTimeString():''}
-async function load(){const authKey=readKey();if(!authKey){state.textContent='Management key required. Save a key in Settings to load live usage.';clearUsage();return}state.textContent='Loading live usage...';try{const r=await fetch(api,{method:'GET',credentials:'same-origin',cache:'no-store',headers:{'X-Management-Key':authKey}});if(!r.ok){if(r.status===401||r.status===403){state.textContent='Management authentication required.'}else{state.textContent='Unable to load live usage.'}clearUsage();return}render(await r.json())}catch(_){state.textContent='Unable to load live usage.';clearUsage()}}
-keyInput.value=readKey();document.getElementById('settings-form').addEventListener('submit',function(event){event.preventDefault();const value=keyInput.value.trim();if(!value){keyStatus.textContent='Enter a Management key.';return}if(!writeKey(value)){keyStatus.textContent='Unable to save the Management key in this browser.';return}keyInput.value=value;keyStatus.textContent='Management key saved for this browser.';load()});document.getElementById('clear-key').addEventListener('click',function(){if(!removeKey()){keyStatus.textContent='Unable to clear the saved Management key.';return}keyInput.value='';keyStatus.textContent='Saved Management key cleared.';load()});document.getElementById('refresh').onclick=load;load();setInterval(load,5000)})()</script></body></html>`
+// Stage table edits locally. Only the explicit save action writes host credential fields.
+const saveAll=document.getElementById('save-all'),configStatus=document.getElementById('config-status');
+let configBusy=false,currentAccounts=[],drafts=new Map(),tableSignature='';
+// Native popovers provide outside-click and Escape dismissal with accessible buttons.
+document.querySelectorAll('[popovertarget]').forEach(button=>{button.addEventListener('click',()=>{const panel=document.getElementById(button.getAttribute('popovertarget'));const rect=button.getBoundingClientRect();const width=Math.min(330,window.innerWidth-32);panel.style.left=Math.max(16,Math.min(rect.right-width,window.innerWidth-width-16))+'px';panel.style.top=Math.max(16,Math.min(rect.bottom+8,window.innerHeight-280))+'px'})});
+async function getConfig(authKey){
+  let url='/v0/management/config/plugins/configs/cpa-oauth-manager';
+  const options={cache:'no-store',headers:{'X-Management-Key':authKey}};
+  let response=await fetch(url,options);
+  if(response.status===404){url='/v0/management/plugins/cpa-oauth-manager/config';response=await fetch(url,options)}
+  if(!response.ok){throw new Error('config')}
+  const config=await response.json();
+  if(!config||typeof config!=='object'||Array.isArray(config)){throw new Error('config')}
+  return {url,config};
+}
+async function listCredentials(authKey){
+  const response=await fetch('/v0/management/auth-files',{cache:'no-store',headers:{'X-Management-Key':authKey}});
+  if(!response.ok){throw new Error('credentials')}
+  const result=await response.json();
+  if(!Array.isArray(result.files)){throw new Error('credentials')}
+  return Promise.all(result.files.map(async file=>{
+    const id=String(file.id||file.name||'').trim();
+    const hash=await crypto.subtle.digest('SHA-256',new TextEncoder().encode('cpa\x00'+id));
+    return {config_id:Array.from(new Uint8Array(hash),b=>b.toString(16).padStart(2,'0')).join(''),name:file.name||id,label:file.email||file.label||file.name||id,provider:file.provider||file.type||'',priority:Number(file.priority??0),weight:Number(file.weight??1),disabled:!!file.disabled,unavailable:!!file.unavailable,runtimeOnly:!!file.runtime_only};
+  }));
+}
+function stageEdit(event){
+  const input=event.target,field=input.dataset.field,key=input.dataset.key;
+  if(!['priority','weight','limit'].includes(field)||configBusy){return}
+  const account=currentAccounts.find(a=>a.config_id===key);
+  if(!account){return}
+  const draft=drafts.get(key)||{...account,changes:{}};
+  if(input.value!==''&&Number(input.value)===account[field]){delete draft.changes[field]}
+  else{draft.changes[field]=input.value}
+  if(Object.keys(draft.changes).length){drafts.set(key,draft)}else{drafts.delete(key)}
+  saveAll.disabled=!drafts.size;
+  setMessage(configStatus,drafts.size?'Unsaved changes':'');
+}
+accounts.addEventListener('input',stageEdit);
+async function saveChanges(){
+  if(configBusy||!drafts.size){return}
+  for(const draft of drafts.values()){
+    for(const [field,value] of Object.entries(draft.changes)){
+      const number=Number(value);
+      if(value===''||!Number.isSafeInteger(number)||(field==='weight'&&number>1000000)||(field==='limit'&&(number<1||number>1000000))){setMessage(configStatus,'Enter valid integers: priority, weight ≤1000000, concurrency 1–1000000.');return}
+    }
+  }
+  const authKey=readKey();
+  if(!authKey){setMessage(configStatus,'Management authentication required.');return}
+  configBusy=true;saveAll.disabled=true;setMessage(configStatus,'Saving...');
+  accounts.querySelectorAll('input').forEach(input=>{input.disabled=true});
+  try{
+    const {url,config}=await getConfig(authKey),latest=await listCredentials(authKey);
+    // Check all targets before writing, so stale drafts cannot overwrite external edits.
+    for(const [key,draft] of drafts){
+      const fresh=latest.find(a=>a.config_id===key);
+      if(!fresh){throw new Error('conflict')}
+      for(const field of Object.keys(draft.changes)){
+        const value=field==='limit'?(config.credential_limits?.[key]??config.max_concurrency??2):fresh[field];
+        if(value!==draft[field]){throw new Error('conflict')}
+      }
+    }
+    for(const [key,draft] of drafts){
+      const patch={name:draft.name};
+      for(const field of ['priority','weight']){if(field in draft.changes){patch[field]=Number(draft.changes[field])}}
+      if(Object.keys(patch).length>1){
+        if(readKey()!==authKey){throw new Error('auth')}
+        const response=await fetch('/v0/management/auth-files/fields',{method:'PATCH',headers:{'X-Management-Key':authKey,'Content-Type':'application/json'},body:JSON.stringify(patch)});
+        if(!response.ok){throw new Error('save')}
+        for(const field of ['priority','weight']){if(field in patch){draft[field]=patch[field];delete draft.changes[field]}}
+      }
+    }
+    const limits={...config.credential_limits};let changed=false;
+    for(const [key,draft] of drafts){if('limit' in draft.changes){limits[key]=Number(draft.changes.limit);changed=true}}
+    if(changed){
+      if(readKey()!==authKey){throw new Error('auth')}
+      const response=await fetch(url,{method:'PUT',headers:{'X-Management-Key':authKey,'Content-Type':'application/json'},body:JSON.stringify({...config,credential_limits:limits})});
+      if(!response.ok){throw new Error('save')}
+      for(const [key,draft] of drafts){if('limit' in draft.changes){draft.limit=limits[key];delete draft.changes.limit}}
+    }
+    drafts.clear();setMessage(configStatus,'All changes saved.');
+  }catch(error){
+    for(const [key,draft] of drafts){if(!Object.keys(draft.changes).length){drafts.delete(key)}}
+    setMessage(configStatus,error.message==='conflict'?'Credentials changed elsewhere. Refresh before saving.':'Some changes could not be saved. Pending edits are retained; retry Save.');
+  }finally{
+    configBusy=false;saveAll.disabled=!drafts.size;
+    accounts.querySelectorAll('input').forEach(input=>{input.disabled=false});
+    load();
+  }
+}
+saveAll.onclick=saveChanges;
+function clearUsage(){tableSignature='';accounts.innerHTML='';document.getElementById('summary-count').textContent='--';summaryTotal.textContent='--';summaryWarm.textContent='--';updated.textContent=''}
+function render(d,list,config){
+  const usage=new Map((d.accounts||[]).map(a=>[a.config_id,a]));
+  currentAccounts=list.map(a=>({...a,limit:config.credential_limits?.[a.config_id]??config.max_concurrency??2,in_flight:usage.get(a.config_id)?.in_flight}));
+  setText(document.getElementById('summary-count'),list.length);
+  const summary=d.summary||{},total=summary.total||{},warm=summary.warm_reserved||{};
+  setText(summaryTotal,(total.in_flight??0)+' / '+(total.limit??0));setText(summaryWarm,(warm.in_flight??0)+' / '+(warm.reserved??0));
+  // Leave input nodes untouched during editing; refresh resumes once changes are saved.
+  const signature=JSON.stringify([language,currentAccounts.map(({in_flight,...a})=>a)]);
+  if(signature!==tableSignature&&!drafts.size&&!configBusy&&!accounts.contains(document.activeElement)){
+    const rows=currentAccounts.map(a=>{
+      const input=(field,min,max)=>'<input type="number" step="1" '+(min!==null?'min="'+min+'" ':'')+(max!==null?'max="'+max+'" ':'')+'data-field="'+field+'" data-key="'+a.config_id+'" value="'+a[field]+'" aria-label="'+esc(t(field==='priority'?'Priority':field==='weight'?'Scheduling weight':'Concurrency limit')+' '+a.label)+'"'+(a.runtimeOnly&&field!=='limit'?' disabled':'')+'>';
+      return '<tr><td>'+esc(a.label)+'<small>'+esc(a.provider+' · '+a.name)+'</small></td><td>'+esc(t(a.disabled?'Disabled':a.unavailable?'Unavailable':'Enabled'))+'</td><td>'+input('priority',null,null)+'</td><td>'+input('weight',null,1000000)+'</td><td>'+input('limit',1,1000000)+'</td><td data-live="'+a.config_id+'">'+(a.in_flight??'—')+'</td></tr>';
+    }).join('')||'<tr class="empty"><td colspan="6">'+esc(t('No available credentials'))+'</td></tr>';
+    if(accounts.innerHTML!==rows){accounts.innerHTML=rows}
+    tableSignature=signature;
+  }
+  accounts.querySelectorAll('[data-live]').forEach(cell=>{setText(cell,usage.get(cell.dataset.live)?.in_flight??'—')});
+  let msg=t('Authority: ')+t(d.authority_state||'unknown');if(d.stale){msg+='; '+t('stale')}if(d.error){msg+='; '+t(d.error)}
+  delete state.dataset.i18n;setText(state,msg);setText(updated,d.last_refresh?t('Last refresh ')+new Date(d.last_refresh).toLocaleTimeString(language):'');
+}
+// Poll silently after the first snapshot and never overlap requests or rebuild unchanged rows.
+let refreshing=false,hasUsage=false;
+async function load(){
+  if(refreshing||configBusy){return}
+  refreshing=true;
+  try{
+    applyLanguage();applyTheme();
+    if(readHostKey()&&readKey()===readHostKey()){setMessage(keyStatus,'Using Management Center authentication.')}
+    const authKey=readKey();const settings=document.getElementById('settings');
+    settings.hidden=!!authKey;settings.open=!authKey;
+    if(!authKey){setMessage(state,'Management key required. Save a key in Settings to load live usage.');clearUsage();hasUsage=false;return}
+    if(!hasUsage){setMessage(state,'Loading live usage...')}
+    const r=await fetch(api,{method:'GET',credentials:'same-origin',cache:'no-store',headers:{'X-Management-Key':authKey}});
+    if(authKey!==readKey()){clearUsage();hasUsage=false;return}
+    if(!r.ok){
+      if(r.status===401||r.status===403){if(authKey===readHostKey()){rejectedHostKey=authKey}settings.hidden=false;settings.open=true;setMessage(state,'Management authentication required.');clearUsage();hasUsage=false}
+      else{setMessage(state,'Unable to load live usage.')}
+      return;
+    }
+    const [data,list,settingsConfig]=await Promise.all([r.json(),listCredentials(authKey),getConfig(authKey)]);
+    render(data,list,settingsConfig.config);hasUsage=true;
+  }catch(_){setMessage(state,'Unable to load live usage.')}
+  finally{refreshing=false}
+}
+document.getElementById('settings').open=!readHostKey()&&!readManualKey();keyInput.value=readManualKey();if(readHostKey()&&readKey()===readHostKey()){setMessage(keyStatus,'Using Management Center authentication.')}document.getElementById('settings-form').addEventListener('submit',function(event){event.preventDefault();const value=keyInput.value.trim();if(!value){setMessage(keyStatus,'Enter a Management key.');return}if(!writeKey(value)){setMessage(keyStatus,'Unable to save the Management key in this browser.');return}keyInput.value=value;setMessage(keyStatus,'Management key saved for this browser.');load()});document.getElementById('clear-key').addEventListener('click',function(){if(!removeKey()){setMessage(keyStatus,'Unable to clear the saved Management key.');return}keyInput.value='';setMessage(keyStatus,'Saved Management key cleared.');load()});document.getElementById('refresh').onclick=load;window.addEventListener('storage',function(event){if(event.key==='cli-proxy-language'||event.key==='cli-proxy-theme'||event.key==='cli-proxy-auth'||event.key==='managementKey'||event.key===null){load()}});load();setInterval(load,5000)})()</script></body></html>`
 
 type managementRPCRequest struct {
 	pluginapi.ManagementRequest
@@ -505,15 +893,26 @@ func handleManagement(raw []byte) ([]byte, error) {
 }
 
 type pluginConfig struct {
-	Enabled           bool          `yaml:"enabled"`
-	MaxConcurrency    int           `yaml:"max_concurrency"`
-	WarmReservedSlots int           `yaml:"warm_reserved_slots"`
-	WaitTimeout       time.Duration `yaml:"wait_timeout"`
-	Authority         string        `yaml:"authority"`
-	RedisPrefix       string        `yaml:"redis_prefix"`
-	RedisAddr         string        `yaml:"redis_addr"`
-	RedisPassword     string        `yaml:"redis_password"`
-	RedisDB           int           `yaml:"redis_db"`
+	CredentialLimits  map[string]int `yaml:"credential_limits"`
+	Enabled           bool           `yaml:"enabled"`
+	MaxConcurrency    int            `yaml:"max_concurrency"`
+	WarmReservedSlots int            `yaml:"warm_reserved_slots"`
+	WaitTimeout       time.Duration  `yaml:"wait_timeout"`
+	Authority         string         `yaml:"authority"`
+	RedisPrefix       string         `yaml:"redis_prefix"`
+	RedisAddr         string         `yaml:"redis_addr"`
+	RedisPassword     string         `yaml:"redis_password"`
+	RedisDB           int            `yaml:"redis_db"`
+}
+
+// Use opaque credential hashes consistently for admission, scheduling and management.
+func (cfg pluginConfig) limitsFor(key string) (int, int) {
+	limit, reserved := cfg.MaxConcurrency, cfg.WarmReservedSlots
+	if override, ok := cfg.CredentialLimits[key]; ok {
+		limit = override
+		reserved = minInt(limit-1, maxInt(1, (limit+4)/5))
+	}
+	return limit, minInt(reserved, limit-1)
 }
 
 type pluginState struct {
@@ -753,6 +1152,11 @@ func configure(raw []byte) error {
 	if cfg.MaxConcurrency < 1 {
 		return fmt.Errorf("max_concurrency must be greater than zero")
 	}
+	for key, limit := range cfg.CredentialLimits {
+		if len(key) != 64 || strings.Trim(key, "0123456789abcdef") != "" || limit < 1 || limit > 1000000 {
+			return fmt.Errorf("credential_limits requires credential hashes and limits between 1 and 1000000")
+		}
+	}
 	if cfg.WarmReservedSlots < 0 {
 		return fmt.Errorf("warm_reserved_slots must not be negative")
 	}
@@ -813,7 +1217,8 @@ func configure(raw []byte) error {
 
 // Registration author identifies the maintainer of this published plugin.
 func pluginRegistration() registration {
-	return registration{SchemaVersion: pluginabi.SchemaVersion, Metadata: pluginapi.Metadata{Name: "凭证并发管理", Version: "0.0.1", Author: "darvintang", GitHubRepository: "https://github.com/darvintang/cpa-oauth-manager", ConfigFields: []pluginapi.ConfigField{
+	return registration{SchemaVersion: pluginabi.SchemaVersion, Metadata: pluginapi.Metadata{Name: "凭证管理", Version: "0.0.2", Author: "darvintang", GitHubRepository: "https://github.com/darvintang/cpa-oauth-manager", ConfigFields: []pluginapi.ConfigField{
+		{Name: "credential_limits", Type: pluginapi.ConfigFieldTypeObject, Description: "Per-credential concurrency limits, keyed by opaque credential IDs from the management UI."},
 		{Name: "max_concurrency", Type: pluginapi.ConfigFieldTypeInteger, Description: "Hard per-account in-flight limit."},
 		{Name: "warm_reserved_slots", Type: pluginapi.ConfigFieldTypeInteger, Description: "Reserved slots for verified warm/strict affinity."},
 		{Name: "wait_timeout", Type: pluginapi.ConfigFieldTypeString, Description: "Bounded admission wait (Go duration, for example 50ms)."},
@@ -822,7 +1227,7 @@ func pluginRegistration() registration {
 		{Name: "redis_addr", Type: pluginapi.ConfigFieldTypeString, Description: "Redis address when authority is redis."},
 		{Name: "redis_password", Type: pluginapi.ConfigFieldTypeString, Description: "Redis password when authority is redis."},
 		{Name: "redis_db", Type: pluginapi.ConfigFieldTypeInteger, Description: "Redis database number."},
-	}}, Capabilities: registrationCapabilities{Scheduler: true, RequestInterceptor: true, RequestInterceptorEnforcesAdmission: true, RequestLifecyclePlugin: true, ManagementAPI: true}}
+	}}, Capabilities: registrationCapabilities{Scheduler: true, SchedulerAcrossPriorities: true, RequestInterceptor: true, RequestInterceptorEnforcesAdmission: true, RequestLifecyclePlugin: true, ManagementAPI: true}}
 }
 
 func schedulerPick(raw []byte) ([]byte, error) {
@@ -843,8 +1248,25 @@ func schedulerPick(raw []byte) ([]byte, error) {
 	}
 	ids := make([]string, 0, len(req.Candidates))
 	seen := make(map[string]struct{}, len(req.Candidates))
+	// Host priority and weight are authoritative; exclude zero-weight credentials.
+	weights := make(map[string]int)
 	for _, c := range req.Candidates {
-		if id := canonicalAuthID(c.ID); id != "" {
+		weight := 1
+		if raw := strings.TrimSpace(c.Attributes["weight"]); raw != "" {
+			parsed, err := strconv.Atoi(raw)
+			if err != nil || parsed > 1000000 {
+				return nil, fmt.Errorf("invalid credential scheduling weight")
+			}
+			weight = maxInt(0, parsed)
+		}
+		weights[canonicalAuthID(c.ID)] = weight
+	}
+	priorities := make(map[string]int)
+	for _, c := range req.Candidates {
+		priorities[canonicalAuthID(c.ID)] = c.Priority
+	}
+	for _, c := range req.Candidates {
+		if id := canonicalAuthID(c.ID); id != "" && weights[id] > 0 {
 			if _, ok := seen[id]; ok {
 				continue
 			}
@@ -857,36 +1279,88 @@ func schedulerPick(raw []byte) ([]byte, error) {
 	}
 	hint, strict, warm := affinityHint(req.Options.Metadata)
 	if strict && hint != "" {
+		// Explicit caller pinning cannot switch identity; ordinary affinity may fail over.
 		for _, id := range ids {
 			if id == hint {
-				ctx, cancel := boundedAuthorityContext()
-				u, err := authority.Snapshot(ctx, accountKey("cpa", id), cfg.MaxConcurrency, cfg.WarmReservedSlots)
-				cancel()
-				if err != nil {
-					return nil, authorityError(err)
-				}
-				if u.InFlight >= cfg.MaxConcurrency {
-					return nil, &AdmissionError{Code: "account_concurrency_limit", HTTPStatus: http.StatusServiceUnavailable, RetryAfter: defaultRetryAfter, Message: "account concurrency limit reached"}
-				}
-				return okEnvelope(pluginapi.SchedulerPickResponse{Handled: true, AuthID: id})
+				ids = []string{id}
+				break
 			}
 		}
 	}
+
 	if warm {
 		ids = preferHint(ids, hint)
 	}
-	ctx, cancel := boundedAuthorityContext()
-	defer cancel()
-	selected, err := chooseCandidate(ctx, authority, ids, cfg.MaxConcurrency, cfg.WarmReservedSlots, func() requestClass {
-		if warm {
-			return classWarm
+	requestID := http.Header(req.Options.Headers).Get(requestReservationHeader)
+	state.mu.Lock()
+	rs := state.requests[requestID]
+	state.mu.Unlock()
+	if rs != nil {
+		rs.mu.Lock()
+		defer rs.mu.Unlock()
+		if rs.terminal || rs.fenced {
+			return nil, ErrAuthorityUnavailable
 		}
-		return classCold
-	}())
-	if err != nil {
-		return nil, authorityError(err)
+		// Release the prior attempt before selecting another credential for this request.
+		if rs.lease.Token != "" {
+			ctx, cancel := boundedAuthorityContext()
+			err := authority.Release(ctx, rs.lease)
+			cancel()
+			if err != nil {
+				return nil, authorityError(err)
+			}
+			stopHeartbeat(rs)
+			state.mu.Lock()
+			delete(state.leases, requestID)
+			delete(state.bound, requestID)
+			state.mu.Unlock()
+			rs.lease, rs.bound = Lease{}, ""
+		}
 	}
-	return okEnvelope(pluginapi.SchedulerPickResponse{Handled: true, AuthID: selected})
+	class := classCold
+	if warm {
+		class = classWarm
+	}
+	for len(ids) > 0 {
+		ctx, cancel := boundedAuthorityContext()
+		selected, err := chooseCandidate(ctx, authority, ids, cfg, class, weights, priorities)
+		cancel()
+		if err != nil {
+			return nil, authorityError(err)
+		}
+		if rs == nil {
+			return okEnvelope(pluginapi.SchedulerPickResponse{Handled: true, AuthID: selected})
+		}
+		selectedClass := class
+		if warm && hint != "" && hint != selected {
+			selectedClass = classCold
+		}
+		limit, reserved := cfg.limitsFor(accountKey("cpa", selected))
+		ctx, cancel = context.WithTimeout(context.Background(), cfg.WaitTimeout)
+		lease, err := authority.Acquire(ctx, accountKey("cpa", selected), limit, reserved, selectedClass)
+		cancel()
+		if err == nil {
+			state.mu.Lock()
+			state.leases[requestID] = lease
+			state.bound[requestID] = selected
+			state.mu.Unlock()
+			rs.lease, rs.bound = lease, selected
+			startHeartbeat(rs, authority, lease)
+			return okEnvelope(pluginapi.SchedulerPickResponse{Handled: true, AuthID: selected})
+		}
+		var capacity *AdmissionError
+		if !errors.Is(err, context.DeadlineExceeded) && !(errors.As(err, &capacity) && capacity.Code == "account_concurrency_limit") {
+			return nil, authorityError(err)
+		}
+		// A competing request took the final slot; try the remaining credentials now.
+		for i, id := range ids {
+			if id == selected {
+				ids = append(ids[:i], ids[i+1:]...)
+				break
+			}
+		}
+	}
+	return nil, &AdmissionError{Code: "account_concurrency_limit", HTTPStatus: http.StatusServiceUnavailable, RetryAfter: defaultRetryAfter, Message: "all eligible credentials are at their concurrency limit"}
 }
 
 func authorityError(err error) error {
@@ -906,6 +1380,20 @@ func interceptBefore(raw []byte) ([]byte, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
+	state.gate.RLock()
+	defer state.gate.RUnlock()
+	state.mu.Lock()
+	if state.cfg.Enabled && req.RequestID != "" {
+		if state.requests[req.RequestID] == nil {
+			state.requests[req.RequestID] = &requestLifecycle{}
+		}
+		// Overwrite untrusted client input with the host lifecycle identity.
+		if req.Headers == nil {
+			req.Headers = make(http.Header)
+		}
+		req.Headers.Set(requestReservationHeader, req.RequestID)
+	}
+	state.mu.Unlock()
 	return okEnvelope(pluginapi.RequestInterceptResponse{Headers: req.Headers, Body: req.Body})
 }
 
@@ -914,6 +1402,7 @@ func interceptAfter(raw []byte) ([]byte, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
+	req.Headers.Del(requestReservationHeader)
 	req.RequestID = strings.TrimSpace(req.RequestID)
 	if req.RequestID == "" {
 		return admissionResponse(&AdmissionError{Code: "invalid_request_id", HTTPStatus: http.StatusBadRequest, Message: "request_id is required"})
@@ -928,7 +1417,7 @@ func interceptAfter(raw []byte) ([]byte, error) {
 	}
 	state.mu.Unlock()
 	if !cfg.Enabled {
-		return okEnvelope(pluginapi.RequestInterceptResponse{Headers: req.Headers, Body: req.Body})
+		return okEnvelope(pluginapi.RequestInterceptResponse{Headers: req.Headers, Body: req.Body, ClearHeaders: []string{requestReservationHeader}})
 	}
 	authID, identityErr := selectedAccountID(req.Metadata, req.AuthID)
 	if identityErr != nil {
@@ -969,11 +1458,11 @@ func interceptAfter(raw []byte) ([]byte, error) {
 		return admissionResponse(&AdmissionError{Code: "account_concurrency_authority_unavailable", HTTPStatus: http.StatusServiceUnavailable, RetryAfter: defaultRetryAfter, Message: "concurrency authority unavailable", Authority: true})
 	}
 	if rs.terminal {
-		return okEnvelope(pluginapi.RequestInterceptResponse{Headers: req.Headers, Body: req.Body})
+		return okEnvelope(pluginapi.RequestInterceptResponse{Headers: req.Headers, Body: req.Body, ClearHeaders: []string{requestReservationHeader}})
 	}
 	old, bound := rs.lease, rs.bound
 	if bound == authID && old.Token != "" {
-		return okEnvelope(pluginapi.RequestInterceptResponse{Headers: req.Headers, Body: req.Body})
+		return okEnvelope(pluginapi.RequestInterceptResponse{Headers: req.Headers, Body: req.Body, ClearHeaders: []string{requestReservationHeader}})
 	}
 	if old.Token != "" {
 		ctxRelease, cancelRelease := boundedAuthorityContext()
@@ -991,7 +1480,8 @@ func interceptAfter(raw []byte) ([]byte, error) {
 		rs.bound = ""
 		stopHeartbeat(rs)
 	}
-	lease, err := authority.Acquire(ctx, key, cfg.MaxConcurrency, cfg.WarmReservedSlots, class)
+	limit, reserved := cfg.limitsFor(key)
+	lease, err := authority.Acquire(ctx, key, limit, reserved, class)
 	if err != nil {
 		var capacity *AdmissionError
 		isCapacity := errors.As(err, &capacity) && capacity.Code == "account_concurrency_limit"
@@ -1013,7 +1503,7 @@ func interceptAfter(raw []byte) ([]byte, error) {
 	state.mu.Unlock()
 	rs.lease, rs.bound = lease, authID
 	startHeartbeat(rs, authority, lease)
-	return okEnvelope(pluginapi.RequestInterceptResponse{Headers: req.Headers, Body: req.Body})
+	return okEnvelope(pluginapi.RequestInterceptResponse{Headers: req.Headers, Body: req.Body, ClearHeaders: []string{requestReservationHeader}})
 }
 
 func complete(raw []byte) ([]byte, error) {

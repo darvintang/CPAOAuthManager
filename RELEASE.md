@@ -14,7 +14,7 @@ published checksums; no local SDK checkout or module replacement is used.
    git diff --exit-code -- go.mod go.sum
    go test ./...
    go vet ./...
-   GOOS=linux GOARCH=amd64 scripts/build-release.sh 0.0.1
+   GOOS=linux GOARCH=amd64 scripts/build-release.sh 0.0.2
    (cd dist && sha256sum --check checksums.txt)
    ```
 
@@ -22,8 +22,8 @@ published checksums; no local SDK checkout or module replacement is used.
 4. Create and push the matching tag, for example:
 
    ```bash
-   git tag -s v0.0.1 -m "Release v0.0.1"
-   git push origin v0.0.1
+   git tag -s v0.0.2 -m "Release v0.0.2"
+   git push origin v0.0.2
    ```
 
 The tag-triggered `Release` workflow reruns tests and vetting, then builds the

@@ -36,6 +36,7 @@ jobs:
       - name: Test and build
         shell: bash
         run: |
+          node scripts/test-management-auth.cjs
           version="${GITHUB_REF_NAME#v}"
           # Surface build failures in public annotations as logs require sign-in.
           if ! bash scripts/build-release.sh "$version" > build.log 2>&1; then
@@ -69,14 +70,23 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cat > "$RUNNER_TEMP/release-notes.md" <<'EOF'
-          凭证并发管理：按凭证限制并发请求，支持缓存亲和、共享并发控制和实时用量查看。
+          凭证管理：统一管理凭证优先级、调度权重与并发上限。
+
+          - 展示全部凭证，修改暂存于页面，点击“保存全部修改”后提交。
+          - 满并发时自动选择其他可用凭证，高优先级满额后可切换到低优先级。
+          - 自动读取管理中心登录信息，支持简体中文、繁體中文、English 和 Русский。
+          - 白色页面布局、优先级与权重说明气泡，静默刷新保留输入和焦点。
+          - 发布前已通过单元测试、竞态检测、页面交互测试及双凭证真实模型并发验证。
+
+          宿主不提供跨凭证文件与插件配置的事务；部分保存失败时保留待提交修改并提示重试。
+          所有可用凭证均满额时返回 503，当前宿主可能将错误码包装为 internal_server_error。
 
           插件 ID：`cpa-oauth-manager`。
           提供 Linux amd64/arm64、macOS amd64/arm64、Windows amd64 安装包、registry.json 插件注册表及 SHA-256 校验文件。
           EOF
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" dist/*.zip dist/registry.json dist/checksums.txt --clobber
-            gh release edit "$GITHUB_REF_NAME" --title "凭证并发管理 $GITHUB_REF_NAME" \
+            gh release edit "$GITHUB_REF_NAME" --title "凭证管理 $GITHUB_REF_NAME" \
               --notes-file "$RUNNER_TEMP/release-notes.md"
             # Remove renamed plugin archives only after every replacement has uploaded.
             gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' > "$RUNNER_TEMP/release-assets.txt"
@@ -91,7 +101,7 @@ jobs:
             done < "$RUNNER_TEMP/release-assets.txt"
           else
             gh release create "$GITHUB_REF_NAME" dist/*.zip dist/registry.json dist/checksums.txt \
-              --verify-tag --title "凭证并发管理 $GITHUB_REF_NAME" \
+              --verify-tag --title "凭证管理 $GITHUB_REF_NAME" \
               --notes-file "$RUNNER_TEMP/release-notes.md"
           fi
           # Verify that the published asset set exactly matches the new packages.

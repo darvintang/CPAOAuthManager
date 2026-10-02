@@ -63,7 +63,7 @@ func TestPluginRegistrationIncludesRequiredRepositoryMetadata(t *testing.T) {
 	if reg.Metadata.GitHubRepository != "https://github.com/darvintang/cpa-oauth-manager" {
 		t.Fatalf("GitHubRepository = %q", reg.Metadata.GitHubRepository)
 	}
-	if reg.Metadata.Name != "凭证并发管理" || reg.Metadata.Version != "0.0.1" || reg.Metadata.Author != "darvintang" || !reg.Capabilities.Scheduler || !reg.Capabilities.RequestInterceptorEnforcesAdmission {
+	if reg.Metadata.Name != "凭证管理" || reg.Metadata.Version != "0.0.2" || reg.Metadata.Author != "darvintang" || !reg.Capabilities.Scheduler || !reg.Capabilities.RequestInterceptorEnforcesAdmission {
 		t.Fatalf("registration = %#v", reg)
 	}
 	if !reg.Capabilities.ManagementAPI {
@@ -153,12 +153,12 @@ func TestManagementUIContainsAuthenticatedRefreshAndFailureStates(t *testing.T) 
 	if strings.Contains(body, `"in_flight":`) || strings.Contains(body, `"accounts_in_use":`) {
 		t.Fatal("unauthenticated resource embeds live allocation values")
 	}
-	for _, want := range []string{"/v0/management/plugins/cpa-oauth-manager/usage", "Settings", "type=\"password\"", "localStorage", "storageKey", "X-Management-Key", "credentials:'same-origin'", "method:'GET'", "Loading live usage", "Management key required.", "Unable to load live usage", "Management authentication required.", "stale", "aria-live", "All available accounts", "summary-total", "summary-warm", "Total (in-flight / limit)", "Warm reserved (in-flight / reserved)", "a.in_flight+' / '+a.limit", "a.warm_flight+' / '+a.reserved", "Save key", "Clear saved key", "removeItem", "setItem"} {
+	for _, want := range []string{"/v0/management/plugins/cpa-oauth-manager/usage", "Settings", "type=\"password\"", "localStorage", "storageKey", "X-Management-Key", "credentials:'same-origin'", "method:'GET'", "Loading live usage", "Management key required.", "Unable to load live usage", "Management authentication required.", "stale", "aria-live", "All available accounts", "summary-total", "summary-warm", "Total (in-flight / limit)", "Warm reserved (in-flight / reserved)", "Save key", "Clear saved key", "removeItem", "setItem"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("UI missing %q", want)
 		}
 	}
-	for _, forbidden := range []string{"sessionStorage", "?management", "Bearer test-secret", "/v0/management/auth-files", "account-secret@example.com", "user@example.com", "available_capacity", "Configured limit", "In flight", "Warm in flight", "General in flight"} {
+	for _, forbidden := range []string{"sessionStorage", "?management", "Bearer test-secret", "account-secret@example.com", "user@example.com", "available_capacity", "Configured limit", "In flight", "Warm in flight", "General in flight"} {
 		if strings.Contains(body, forbidden) {
 			t.Errorf("UI contains forbidden credential material %q", forbidden)
 		}
@@ -171,8 +171,8 @@ func TestManagementUIKeyLifecycleAndAuthFailureHandling(t *testing.T) {
 		name string
 		want []string
 	}{
-		{name: "first run requires key", want: []string{"const authKey=readKey();if(!authKey)", "Management key required. Save a key in Settings"}},
-		{name: "save and reload use", want: []string{"localStorage.getItem(storageKey)", "localStorage.setItem(storageKey,value)", "keyInput.value=readKey()", "headers:{'X-Management-Key':authKey}"}},
+		{name: "first run requires key", want: []string{"settings.hidden=!!authKey;settings.open=!authKey;", "Management key required. Save a key in Settings"}},
+		{name: "save and reload use", want: []string{"localStorage.getItem(storageKey)", "localStorage.setItem(storageKey,value)", "keyInput.value=readManualKey()", "headers:{'X-Management-Key':authKey}"}},
 		{name: "update", want: []string{"keyInput.value.trim()", "writeKey(value)", "Management key saved for this browser."}},
 		{name: "clear", want: []string{"localStorage.removeItem(storageKey)", "keyInput.value=''", "Saved Management key cleared."}},
 		{name: "401 and 403", want: []string{"r.status===401||r.status===403", "Management authentication required."}},
@@ -1009,7 +1009,7 @@ func TestWarmReservationAndColdFairSelection(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	chosen, err := chooseCandidate(context.Background(), a, []string{"a", "b"}, 4, 1, classCold)
+	chosen, err := chooseCandidate(context.Background(), a, []string{"a", "b"}, pluginConfig{MaxConcurrency: 4, WarmReservedSlots: 1}, classCold, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1936,5 +1936,147 @@ func (f *leaseFakeRedis) Eval(_ context.Context, script string, keys []string, a
 	default:
 		_ = keys
 		return nil, errors.New("unknown script")
+	}
+}
+
+// Per-credential limits must agree across admission, scheduling and the UI snapshot.
+func TestPerCredentialLimitsAcrossAllPaths(t *testing.T) {
+	resetTestState()
+	t.Cleanup(resetTestState)
+	keyA, keyB := accountKey("cpa", "a"), accountKey("cpa", "b")
+	config := fmt.Sprintf("max_concurrency: 2\nwait_timeout: 1ms\ncredential_limits:\n  %s: 4\n  %s: 1\n", keyA, keyB)
+	rawConfig, _ := json.Marshal(lifecycleRequest{SchemaVersion: 4, ConfigYAML: []byte(config)})
+	if err := configure(rawConfig); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		raw, _ := json.Marshal(testRequestInterceptRequest{RequestID: fmt.Sprint(i), AuthID: "a"})
+		out, err := interceptAfter(raw)
+		if err != nil || strings.Contains(string(out), `"terminate":true`) || strings.Contains(string(out), `"Terminate":true`) {
+			t.Fatalf("credential a request %d rejected: %s, %v", i, out, err)
+		}
+	}
+	state.mu.Lock()
+	cfg, authority := state.cfg, state.authority
+	state.mu.Unlock()
+	selected, err := chooseCandidate(context.Background(), authority, []string{"a", "b"}, cfg, classCold, nil, nil)
+	if err != nil || selected != "b" {
+		t.Fatalf("selected %q, err=%v", selected, err)
+	}
+	metadata := map[string]pluginapi.HostAuthFileEntry{keyA: {ID: "a", Name: "a.json"}, keyB: {ID: "b", Name: "b.json"}}
+	accounts, _, err := availableAccountSnapshots(context.Background(), authority, metadata, cfg)
+	if err != nil || len(accounts) != 2 {
+		t.Fatalf("snapshot=%v, err=%v", accounts, err)
+	}
+	for _, account := range accounts {
+		want := cfg.CredentialLimits[account.ConfigID]
+		if account.Limit != want || account.Reserved >= want {
+			t.Fatalf("inconsistent limit: %#v", account)
+		}
+	}
+	if summaryFromAccounts(accounts).Total.Limit != 5 {
+		t.Fatal("summary does not sum individual credential limits")
+	}
+	bad, _ := json.Marshal(lifecycleRequest{ConfigYAML: []byte("credential_limits:\n  " + keyA + ": 0\n")})
+	if err := configure(bad); err == nil {
+		t.Fatal("accepted zero credential limit")
+	}
+}
+
+// Host priority and zero-weight exclusion must remain effective with plugin scheduling.
+func TestSchedulerRespectsCredentialPriorityAndWeight(t *testing.T) {
+	resetTestState()
+	t.Cleanup(resetTestState)
+	state.mu.Lock()
+	state.cfg.MaxConcurrency = 10
+	state.authority = newLocalAuthority()
+	state.mu.Unlock()
+	for _, candidates := range []string{
+		`[{"ID":"off","Priority":999,"Attributes":{"weight":"0"}},{"ID":"preferred","Priority":2,"Attributes":{"weight":"2"}},{"ID":"lower","Priority":1,"Attributes":{"weight":"100"}}]`,
+		`[{"ID":"preferred","Priority":0,"Attributes":{"weight":"1"}},{"ID":"off","Priority":0,"Attributes":{"weight":"0"}}]`,
+	} {
+		for i := 0; i < 20; i++ {
+			out, err := schedulerPick([]byte(`{"Candidates":` + candidates + `}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var env envelope
+			if err = json.Unmarshal(out, &env); err != nil {
+				t.Fatal(err)
+			}
+			var response pluginapi.SchedulerPickResponse
+			if err = json.Unmarshal(env.Result, &response); err != nil {
+				t.Fatal(err)
+			}
+			if response.AuthID != "preferred" {
+				t.Fatalf("unexpected selection: %s", out)
+			}
+		}
+	}
+}
+
+// Reserve inside scheduler.pick so simultaneous requests cannot all choose one free slot.
+func TestSchedulerReservesAndFallsBackAcrossPriorities(t *testing.T) {
+	resetTestState()
+	t.Cleanup(resetTestState)
+	state.mu.Lock()
+	state.cfg.MaxConcurrency = 1
+	state.cfg.WarmReservedSlots = 0
+	state.cfg.WaitTimeout = time.Millisecond
+	state.authority = newLocalAuthority()
+	state.mu.Unlock()
+	candidates := []pluginapi.SchedulerAuthCandidate{{ID: "high", Priority: 10}, {ID: "low", Priority: 1}}
+	pick := func(requestID string) (string, error) {
+		before, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: requestID})
+		if _, err := interceptBefore(before); err != nil {
+			return "", err
+		}
+		req, _ := json.Marshal(pluginapi.SchedulerPickRequest{Candidates: candidates, Options: pluginapi.SchedulerOptions{Headers: map[string][]string{requestReservationHeader: {requestID}}}})
+		out, err := schedulerPick(req)
+		if err != nil {
+			return "", err
+		}
+		var env envelope
+		_ = json.Unmarshal(out, &env)
+		var response pluginapi.SchedulerPickResponse
+		_ = json.Unmarshal(env.Result, &response)
+		return response.AuthID, nil
+	}
+	first, err := pick("one")
+	if err != nil || first != "high" {
+		t.Fatalf("first=%s %v", first, err)
+	}
+	second, err := pick("two")
+	if err != nil || second != "low" {
+		t.Fatalf("second=%s %v", second, err)
+	}
+	if _, err = pick("three"); err == nil {
+		t.Fatal("all-full request admitted")
+	}
+	post, _ := json.Marshal(testRequestInterceptRequest{RequestID: "one", AuthID: "high"})
+	out, err := interceptAfter(post)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	_ = json.Unmarshal(out, &env)
+	var response pluginapi.RequestInterceptResponse
+	_ = json.Unmarshal(env.Result, &response)
+	if response.Terminate || len(response.ClearHeaders) != 1 || response.ClearHeaders[0] != requestReservationHeader {
+		t.Fatalf("post-auth response: %s", out)
+	}
+	state.mu.Lock()
+	n := len(state.leases)
+	state.mu.Unlock()
+	if n != 2 {
+		t.Fatalf("leases=%d", n)
+	}
+	done, _ := json.Marshal(pluginapi.RequestCompletion{RequestID: "one"})
+	if _, err = complete(done); err != nil {
+		t.Fatal(err)
+	}
+	again, err := pick("four")
+	if err != nil || again != "high" {
+		t.Fatalf("recovery=%s %v", again, err)
 	}
 }

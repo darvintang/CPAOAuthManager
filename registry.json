@@ -3,10 +3,10 @@
   "plugins": [
     {
       "id": "cpa-oauth-manager",
-      "name": "凭证并发管理",
-      "description": "按凭证限制并发请求，支持缓存亲和、共享并发控制和实时用量查看。",
+      "name": "凭证管理",
+      "description": "统一管理凭证优先级、调度权重与并发上限，支持批量保存、满额切换和实时用量查看。",
       "author": "darvintang",
-      "version": "0.0.1",
+      "version": "0.0.2",
       "repository": "https://github.com/darvintang/cpa-oauth-manager",
       "homepage": "https://github.com/darvintang/cpa-oauth-manager",
       "license": "MIT",

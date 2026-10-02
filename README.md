@@ -1,6 +1,6 @@
-# 凭证并发管理
+# 凭证管理
 
-按凭证限制并发请求，支持缓存亲和、共享并发控制和实时用量查看。
+统一管理凭证优先级、调度权重与并发上限，支持批量保存、满额切换和实时用量查看。
 
 The plugin uses the official CLIProxyAPI dynamic-library plugin ABI and request
 lifecycle hooks. It limits upstream calls per selected CPA account, returns
@@ -9,7 +9,7 @@ authenticated Management Center view of account usage.
 
 ## Features
 
-- Per-account hard in-flight concurrency limits.
+- Per-account hard in-flight concurrency limits, with individual overrides editable in the plugin UI.
 - Local authority for a single CPA process.
 - Optional Redis authority for multiple CPA processes sharing the same account
   pool.
@@ -28,7 +28,7 @@ authenticated Management Center view of account usage.
 
 - Host: CLIProxyAPI/CPA with the native plugin ABI and request-lifecycle support.
 - Plugin ID: `cpa-oauth-manager`.
-- Current release: `v0.0.1`.
+- Current release: `v0.0.2`.
 - Published binary targets: **Linux amd64/arm64, macOS amd64/arm64, Windows amd64**.
 
 Release archives use the platform-native dynamic library name: `.so` on Linux,
@@ -75,7 +75,9 @@ silently bypassing the configured hard limit.
 
 ## Admission and failover behavior
 
-The plugin acquires a lease only after CPA supplies the selected auth ID.
+The plugin reserves a lease during scheduler selection, before CPA starts the
+upstream request. It tries remaining eligible credentials if another request
+takes the final slot. After-auth admission reuses that lease without double counting.
 Repeated post-auth callbacks for the same request are idempotent. When CPA
 retries or fails over to another account, the previous lease is released before
 the new lease is acquired, so leases do not stack across accounts.
@@ -126,33 +128,47 @@ names and filenames are not used as availability heuristics, so an available
 account whose name contains `401` remains visible.
 
 The view displays idle available accounts as `0 / limit` and `0 / reserved`.
-The table remains:
-
-- `Account`
-- `Total (in-flight / limit)`
-- `Warm reserved (in-flight / reserved)`
+The editable table lists all credentials with their status, priority, scheduling
+weight, concurrency limit and active requests. Summary metrics cover available
+credentials only.
 
 The **All available accounts** summary sums only the rows shown in that table.
 Filtered or unavailable accounts do not contribute to the totals.
 
-The UI asks for the CPA Management key in its Settings area and stores it only
-in browser-local storage scoped to the current origin. The plugin does not
-request or store auth JSON, provider tokens, passwords, or the Management key.
+The page follows the Management Center language (简体中文、繁體中文、English、Русский)
+and theme. Background refresh preserves the current rows and in-progress edits.
+The table includes enabled, disabled and temporarily unavailable credentials.
+Edit priority, scheduling weight and concurrency limits locally, then click Save all
+changes. Priority and weight use the host credential field API; concurrency limits
+use plugin configuration. Failed saves keep pending edits for retry; the host does
+not provide a transaction across credential files and plugin configuration.
+The plugin persists opaque
+credential IDs under `credential_limits` and uses those limits for admission,
+scheduling, and summary totals. `max_concurrency` remains the fallback for
+credentials without an override.
+
+The UI reuses the Management Center's saved login on the same origin, including
+its encoded storage and legacy Management key format. Enable “Remember password”
+when signing in to the Management Center. Automatically read keys are used only
+in authentication headers and are never copied into the plugin's password field
+or storage. The password field is hidden when authentication is available and shown only
+when credentials are missing or rejected.
+The plugin does not request or store provider credentials.
 
 ## Install the published release
 
 Download the assets from the public GitHub Release:
 
-<https://github.com/darvintang/cpa-oauth-manager/releases/tag/v0.0.1>
+<https://github.com/darvintang/cpa-oauth-manager/releases/tag/v0.0.2>
 
 The release contains all CPA Plugin Store required targets:
 
 ```text
-cpa-oauth-manager_0.0.1_linux_amd64.zip
-cpa-oauth-manager_0.0.1_linux_arm64.zip
-cpa-oauth-manager_0.0.1_darwin_amd64.zip
-cpa-oauth-manager_0.0.1_darwin_arm64.zip
-cpa-oauth-manager_0.0.1_windows_amd64.zip
+cpa-oauth-manager_0.0.2_linux_amd64.zip
+cpa-oauth-manager_0.0.2_linux_arm64.zip
+cpa-oauth-manager_0.0.2_darwin_amd64.zip
+cpa-oauth-manager_0.0.2_darwin_arm64.zip
+cpa-oauth-manager_0.0.2_windows_amd64.zip
 registry.json
 checksums.txt
 ```
@@ -161,7 +177,7 @@ Verify the archive before installation:
 
 ```bash
 sha256sum --check checksums.txt
-unzip -t cpa-oauth-manager_0.0.1_linux_amd64.zip
+unzip -t cpa-oauth-manager_0.0.2_linux_amd64.zip
 ```
 
 Each archive contains exactly one root-level dynamic library named for its
@@ -172,7 +188,7 @@ For manual installation, place the versioned library under the CLIProxyAPI
 plugin directory for the target platform:
 
 ```text
-plugins/linux/amd64/cpa-oauth-manager-v0.0.1.so
+plugins/linux/amd64/cpa-oauth-manager-v0.0.2.so
 ```
 
 Restart or reload CLIProxyAPI according to its normal plugin lifecycle after
@@ -185,12 +201,12 @@ The CLIProxyAPI SDK is a public, versioned module dependency pinned in
 `go.mod`, with its checksums committed in `go.sum`. The project does not use a
 local SDK checkout or a `replace` directive.
 
-To run the same checks and a native target build used by release `v0.0.1`:
+To run the same checks and a native target build used by release `v0.0.2`:
 
 ```bash
 go mod tidy
 git diff --exit-code -- go.mod go.sum
-GOOS=linux GOARCH=amd64 scripts/build-release.sh 0.0.1
+GOOS=linux GOARCH=amd64 scripts/build-release.sh 0.0.2
 (cd dist && sha256sum --check checksums.txt)
 ```
 
@@ -223,3 +239,9 @@ to this repository or to a release asset.
 ## License
 
 MIT. See the repository license notice for the applicable terms.
+
+Higher-priority credentials are preferred while they have capacity; lower tiers
+are eligible when the higher tiers are full. Zero weight excludes a credential
+from automatic selection. Explicit caller pinning still preserves identity.
+The current host may wrap an all-full scheduler rejection as HTTP 503 with
+`internal_server_error`; automatic failover happens before that response.

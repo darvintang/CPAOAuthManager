@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	mathrand "math/rand/v2"
 	"net"
 	"net/http"
 	"sort"
@@ -48,6 +49,7 @@ type Usage struct {
 }
 
 type AccountUsage struct {
+	ConfigID   string `json:"config_id,omitempty"` // Opaque ID for per-credential settings; never an auth filename or token.
 	Key        string `json:"-"`
 	Label      string `json:"label"`
 	Limit      int    `json:"limit"`
@@ -505,12 +507,13 @@ type candidateScore struct {
 	index    int
 }
 
-func chooseCandidate(ctx context.Context, authority Authority, candidates []string, limit, reserved int, class requestClass) (string, error) {
+func chooseCandidate(ctx context.Context, authority Authority, candidates []string, cfg pluginConfig, class requestClass, weights, priorities map[string]int) (string, error) {
 	if authority == nil {
 		return "", ErrAuthorityUnavailable
 	}
 	var scores []candidateScore
 	for i, id := range candidates {
+		limit, reserved := cfg.limitsFor(accountKey("cpa", id))
 		u, err := authority.Snapshot(ctx, accountKey("cpa", id), limit, reserved)
 		if err != nil {
 			return "", err
@@ -529,6 +532,36 @@ func chooseCandidate(ctx context.Context, authority Authority, candidates []stri
 	}
 	if len(scores) == 0 {
 		return "", &AdmissionError{Code: "account_concurrency_limit", HTTPStatus: http.StatusServiceUnavailable, RetryAfter: defaultRetryAfter, Message: "account concurrency limit reached"}
+	}
+	// Consider lower-priority tiers only when every higher-priority credential is full.
+	maxPriority := priorities[scores[0].id]
+	for _, score := range scores {
+		if priorities[score.id] > maxPriority {
+			maxPriority = priorities[score.id]
+		}
+	}
+	eligible := scores[:0]
+	for _, score := range scores {
+		if priorities[score.id] == maxPriority {
+			eligible = append(eligible, score)
+		}
+	}
+	scores = eligible
+	// Respect explicit host weights among eligible credentials; preserve warm affinity.
+	if class == classCold && len(weights) > 0 {
+		total := 0
+		for _, score := range scores {
+			total += weights[score.id]
+		}
+		if total > 0 {
+			pick := mathrand.IntN(total)
+			for _, score := range scores {
+				pick -= weights[score.id]
+				if pick < 0 {
+					return score.id, nil
+				}
+			}
+		}
 	}
 	sort.SliceStable(scores, func(i, j int) bool {
 		if scores[i].inFlight != scores[j].inFlight {
